@@ -1,0 +1,434 @@
+{
+  "_meta": {
+    "purpose": "Central Nepali terminology for RatnaOS. One concept, one Nepali word. Used by scripts/check_nepali.cjs to detect banned variants.",
+    "updated": "2026-11-18",
+    "rules": [
+      "Prefer everyday Nepali used in jewellery shops over Sanskrit-heavy formal words.",
+      "Keep trade words that traders actually say (कारिगर, जर्ती, ज्याला, तोला, लाल, माशा).",
+      "Never translate established units, brand names or abbreviations (BOM, CSV, PDF, VAT, PAN, GST, HSN, HUID, SKU).",
+      "Amounts, weights and dates are display-formatted only; stored values never change."
+    ]
+  },
+  "terms": [
+    {
+      "en": "Dashboard",
+      "ne": "मुख्य पृष्ठ",
+      "avoid": [
+        "ड्यासबोर्ड"
+      ]
+    },
+    {
+      "en": "Inventory",
+      "ne": "मौज्दात",
+      "avoid": [
+        "भण्डार",
+        "इन्भेन्टरी"
+      ]
+    },
+    {
+      "en": "Stock",
+      "ne": "मौज्दात",
+      "avoid": [
+        "स्टक"
+      ]
+    },
+    {
+      "en": "POS",
+      "ne": "बिक्री काउन्टर",
+      "avoid": [
+        "पोइन्ट अफ सेल",
+        "बिक्री केन्द्र"
+      ]
+    },
+    {
+      "en": "Sales",
+      "ne": "बिक्री",
+      "avoid": [
+        "सेल्स"
+      ]
+    },
+    {
+      "en": "Purchase",
+      "ne": "खरिद",
+      "avoid": [
+        "क्रय"
+      ]
+    },
+    {
+      "en": "Customer",
+      "ne": "ग्राहक",
+      "avoid": []
+    },
+    {
+      "en": "Supplier",
+      "ne": "आपूर्तिकर्ता",
+      "avoid": [
+        "सप्लायर"
+      ]
+    },
+    {
+      "en": "Goldsmith",
+      "ne": "कालिगड",
+      "avoid": [],
+      "note": "Module and records use कारिगर, the shop-floor word; कालिगड is used when speaking about the craftsperson."
+    },
+    {
+      "en": "Karigar",
+      "ne": "कारिगर",
+      "avoid": [
+        "कालीगढ"
+      ]
+    },
+    {
+      "en": "Invoice",
+      "ne": "बिल",
+      "avoid": [
+        "बिजक",
+        "इनभ्वाइस"
+      ]
+    },
+    {
+      "en": "Receipt",
+      "ne": "रसिद",
+      "avoid": [
+        "रिसिट"
+      ]
+    },
+    {
+      "en": "Exchange",
+      "ne": "साटासाट",
+      "avoid": [
+        "सट्टापट्टा",
+        "एक्सचेन्ज"
+      ]
+    },
+    {
+      "en": "Old gold",
+      "ne": "पुरानो सुन",
+      "avoid": [
+        "पुरानो गोल्ड"
+      ]
+    },
+    {
+      "en": "Making charge",
+      "ne": "ज्याला",
+      "avoid": [
+        "मेकिङ चार्ज",
+        "बनाइ शुल्क"
+      ]
+    },
+    {
+      "en": "Wastage",
+      "ne": "जर्ती",
+      "avoid": [
+        "वेस्टेज",
+        "क्षति"
+      ]
+    },
+    {
+      "en": "Purity",
+      "ne": "शुद्धता",
+      "avoid": [
+        "प्युरिटी"
+      ]
+    },
+    {
+      "en": "Weight",
+      "ne": "तौल",
+      "avoid": [
+        "वजन"
+      ]
+    },
+    {
+      "en": "Gross weight",
+      "ne": "कुल तौल",
+      "avoid": [
+        "ग्रस वेट"
+      ]
+    },
+    {
+      "en": "Net weight",
+      "ne": "खुद तौल",
+      "avoid": [
+        "नेट वेट"
+      ]
+    },
+    {
+      "en": "Balance",
+      "ne": "बाँकी",
+      "avoid": [
+        "ब्यालेन्स"
+      ]
+    },
+    {
+      "en": "Due amount",
+      "ne": "बाँकी रकम",
+      "avoid": [
+        "बक्यौता"
+      ]
+    },
+    {
+      "en": "Payment",
+      "ne": "भुक्तानी",
+      "avoid": [
+        "पेमेन्ट"
+      ]
+    },
+    {
+      "en": "Profit",
+      "ne": "नाफा",
+      "avoid": [
+        "लाभ"
+      ]
+    },
+    {
+      "en": "Loss",
+      "ne": "घाटा",
+      "avoid": [
+        "नोक्सान",
+        "लस"
+      ]
+    },
+    {
+      "en": "Expense",
+      "ne": "खर्च",
+      "avoid": [
+        "एक्सपेन्स"
+      ]
+    },
+    {
+      "en": "Total",
+      "ne": "जम्मा",
+      "avoid": [
+        "टोटल"
+      ]
+    },
+    {
+      "en": "Amount",
+      "ne": "रकम",
+      "avoid": [
+        "एमाउन्ट"
+      ]
+    },
+    {
+      "en": "Report",
+      "ne": "प्रतिवेदन",
+      "avoid": [
+        "रिपोर्ट"
+      ]
+    },
+    {
+      "en": "Settings",
+      "ne": "सेटिङ",
+      "avoid": [
+        "सेटिङ्स"
+      ]
+    },
+    {
+      "en": "Edit",
+      "ne": "सच्याउनुहोस्",
+      "avoid": [
+        "सम्पादन",
+        "एडिट"
+      ]
+    },
+    {
+      "en": "Delete",
+      "ne": "हटाउनुहोस्",
+      "avoid": [
+        "मेटाउनुहोस्",
+        "डिलिट"
+      ]
+    },
+    {
+      "en": "Save",
+      "ne": "सुरक्षित गर्नुहोस्",
+      "avoid": [
+        "सेव"
+      ]
+    },
+    {
+      "en": "Add",
+      "ne": "थप्नुहोस्",
+      "avoid": [
+        "एड"
+      ]
+    },
+    {
+      "en": "Search",
+      "ne": "खोज्नुहोस्",
+      "avoid": [
+        "सर्च"
+      ]
+    },
+    {
+      "en": "Gold",
+      "ne": "सुन",
+      "avoid": [
+        "गोल्ड"
+      ]
+    },
+    {
+      "en": "Silver",
+      "ne": "चाँदी",
+      "avoid": [
+        "सिल्भर"
+      ]
+    },
+    {
+      "en": "Diamond",
+      "ne": "हिरा",
+      "avoid": [
+        "डाइमन्ड"
+      ]
+    },
+    {
+      "en": "Gemstone",
+      "ne": "रत्न",
+      "avoid": [
+        "जेमस्टोन"
+      ]
+    },
+    {
+      "en": "Stone",
+      "ne": "पत्थर",
+      "avoid": [
+        "स्टोन"
+      ],
+      "note": "Use पत्थर for a stone in a piece; रत्न for precious/semi-precious gem categories."
+    },
+    {
+      "en": "Jewellery",
+      "ne": "गहना",
+      "avoid": [
+        "ज्वेलरी"
+      ]
+    },
+    {
+      "en": "Necklace",
+      "ne": "सिक्री",
+      "avoid": [
+        "नेक्लेस"
+      ],
+      "note": "हार is understood but सिक्री is the everyday shop word."
+    },
+    {
+      "en": "Ring",
+      "ne": "औँठी",
+      "avoid": [
+        "औंठी",
+        "रिङ"
+      ]
+    },
+    {
+      "en": "Bangle",
+      "ne": "बाला",
+      "avoid": [
+        "चुरा",
+        "ब्याङ्गल"
+      ],
+      "note": "चुरा is understood; बाला is the common Nepali shop term."
+    },
+    {
+      "en": "Bracelet",
+      "ne": "ब्रेसलेट",
+      "avoid": [
+        "ब्रेस्लेट"
+      ]
+    },
+    {
+      "en": "Earrings",
+      "ne": "कानका गहना",
+      "avoid": [
+        "इयररिङ"
+      ]
+    },
+    {
+      "en": "Anklet",
+      "ne": "पाउजेब",
+      "avoid": [
+        "पायल"
+      ]
+    },
+    {
+      "en": "Pendant",
+      "ne": "लकेट",
+      "avoid": [
+        "पेन्डेन्ट"
+      ]
+    },
+    {
+      "en": "Tola",
+      "ne": "तोला",
+      "avoid": []
+    },
+    {
+      "en": "Masha",
+      "ne": "माशा",
+      "avoid": []
+    },
+    {
+      "en": "Lal",
+      "ne": "लाल",
+      "avoid": []
+    },
+    {
+      "en": "Gram",
+      "ne": "ग्राम",
+      "avoid": [
+        "ग्रेम"
+      ]
+    },
+    {
+      "en": "Karat",
+      "ne": "क्यारेट"
+    },
+    {
+      "en": "Verification needed",
+      "ne": "प्रमाणित गर्न बाँकी",
+      "avoid": [
+        "प्रमाणीकरण आवश्यक"
+      ]
+    },
+    {
+      "en": "Transaction",
+      "ne": "कारोबार",
+      "avoid": [
+        "ट्रान्जेक्सन"
+      ]
+    },
+    {
+      "en": "No data",
+      "ne": "कुनै विवरण भेटिएन",
+      "avoid": [
+        "डाटा उपलब्ध छैन"
+      ]
+    },
+    {
+      "en": "Language",
+      "ne": "भाषा",
+      "avoid": []
+    },
+    {
+      "en": "Knowledge Center",
+      "ne": "जानकारी केन्द्र",
+      "avoid": [
+        "ज्ञान केन्द्र"
+      ]
+    },
+    {
+      "en": "Measurement",
+      "ne": "नाप",
+      "avoid": [
+        "मापन"
+      ]
+    },
+    {
+      "en": "Unit",
+      "ne": "एकाइ",
+      "avoid": [
+        "इकाई"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "name": "ratnaos-pwa",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build && node scripts/copy_static.cjs",
+    "preview": "vite preview --host 0.0.0.0",
+    "i18n:extract": "node scripts/extract_i18n.cjs --write",
+    "i18n:check": "node scripts/extract_i18n.cjs --quiet",
+    "ne:check": "node scripts/check_nepali.cjs --strict",
+    "test:accounting": "node --test scripts/test_accounting.mjs"
+  },
+  "dependencies": {
+    "nepali-date-converter": "^3.4.2",
+    "vite": "^5.4.10"
+  }
+}
