@@ -14,6 +14,7 @@ const baseState = (overrides = {}) => ({
   sales: [],
   expenses: [],
   metalManagement: { transactions: [] },
+  settings: { taxRate: 13, taxInclusive: true },
   ...overrides
 });
 
@@ -27,7 +28,7 @@ const sale = (overrides = {}) => ({
   tax: 1235,
   total: 10735,
   payments: [{ method: 'Cash', amount: 10735 }],
-  items: [{ itemId: 'i1', qty: 1, total: 10735 }],
+  items: [{ itemId: 'i1', qty: 1, basePrice: 10000, discount: 0, netWeight: 10, purity: 22, metalRate: 10000, sellingPrice: 10735, costPrice: 4000 }],
   ...overrides
 });
 
@@ -69,8 +70,8 @@ test('manual journal posts balanced with sequence', () => {
 
 test('duplicate source is not double posted', () => {
   const state = baseState({ sales: [sale()] });
-  const first = postSale(state, state.sales[0], state.items);
-  const second = postSale(state, state.sales[0], state.items);
+  const first = postSale(state, state.sales[0], state.sales[0].items);
+  const second = postSale(state, state.sales[0], state.sales[0].items);
   assert.equal(first.ok, true);
   assert.equal(second.ok, false);
   assert.equal(second.duplicate, true);
@@ -80,18 +81,20 @@ test('duplicate source is not double posted', () => {
 test('sale posts revenue, VAT, COGS and receivable correctly', () => {
   const state = baseState();
   const s = sale({ id: 's2', payments: [{ method: 'Cash', amount: 5000 }] });
-  const r = postSale(state, s, state.items);
+  const r = postSale(state, s, s.items);
   assert.equal(r.ok, true);
   const lines = state.accounting.lines.filter(l => l.journalId === r.journal.id);
   const total = lines.reduce((sum, l) => sum + l.debit, 0);
   assert.equal(total, lines.reduce((sum, l) => sum + l.credit, 0));
-  assert.equal(total, toMinor(10735) + toMinor(4000));
+  // Recalculated total: basePrice 10000 * qty 1 = 10000 NPR subtotal, inclusive 13% VAT
+  // totalMinor = round(1000000 / 1.13) = 884956; taxMinor = 115044; revenue = 769912
+  assert.equal(total, 884956 + 400000);
   const ar = lines.filter(l => l.account === '1100').reduce((s, l) => s + l.debit, 0);
-  assert.equal(ar, toMinor(5735));
+  assert.equal(ar, 384956);
   const vat = lines.filter(l => l.account === '2100').reduce((s, l) => s + l.credit, 0);
-  assert.equal(vat, toMinor(1235));
+  assert.equal(vat, 115044);
   const revenue = lines.filter(l => l.account === '4000').reduce((s, l) => s + l.credit, 0);
-  assert.equal(revenue, toMinor(9500));
+  assert.equal(revenue, 769912);
 });
 
 test('expense and supplier payment keep the ledger balanced', () => {
@@ -240,4 +243,110 @@ test('fiscal year close transfers profit and locks the period', () => {
   assert.equal(fy.status, 'open');
   assert.equal(tb2(state).balanced, true);
   assert.equal(postJournal(state, { sourceType: 'manual', sourceId: 'after-reopen', date: '2026-09-02', lines: [makeLine('1000', 5), makeLine('4000', 0, 5)] }).ok, true);
+});
+
+test('postMetalTxn rejects zero or negative value', () => {
+  const state = baseState();
+  ensureAccounting(state);
+  const r1 = postMetalTxn(state, { id: 't-neg', type: 'PURCHASE', metal: 'Gold', value: 0, date: '2026-11-03' });
+  assert.equal(r1.ok, false);
+  assert.match(r1.error, /No financial value|value/i);
+  const r2 = postMetalTxn(state, { id: 't-neg2', type: 'PURCHASE', metal: 'Gold', value: -100, date: '2026-11-03' });
+  assert.equal(r2.ok, false);
+  assert.match(r2.error, /No financial value|value/i);
+  assert.equal(state.accounting.journals.length, 0);
+});
+
+test('validateLines rejects negative amounts', () => {
+  const r = validateLines([
+    { account: '1000', debit: -500, credit: 0 },
+    { account: '4000', debit: 0, credit: -500 }
+  ]);
+  assert.equal(r.ok, false);
+  assert.match(r.error, /cannot be negative/i);
+});
+
+test('makeLine clamps negative values to zero then rejects zero line', () => {
+  assert.throws(() => makeLine('1000', -500, 0), /cannot be zero/);
+  assert.throws(() => makeLine('1000', 0, -500), /cannot be zero/);
+});
+
+test('postVoucher rejects unbalanced lines', () => {
+  const state = baseState();
+  ensureAccounting(state);
+  const r = postVoucher(state, {
+    type: 'Journal', date: '2026-11-10', reference: 'V-1', memo: 'Unbalanced',
+    lines: [makeLine('1000', 1000), makeLine('4000', 0, 500)]
+  });
+  assert.equal(r.ok, false);
+  assert.match(r.error, /Unbalanced|unbalanced|rejected/i);
+  assert.equal(state.accounting.journals.length, 0);
+});
+
+test('postExpense rejects zero or negative amount', () => {
+  const state = baseState();
+  ensureAccounting(state);
+  const r1 = postExpense(state, { id: 'e-neg', date: '2026-11-01', category: 'Rent', amount: 0, paymentMethod: 'Cash', status: 'paid' });
+  assert.equal(r1.ok, false);
+  assert.match(r1.error, /amount required|amount/i);
+  const r2 = postExpense(state, { id: 'e-neg2', date: '2026-11-01', category: 'Rent', amount: -500, paymentMethod: 'Cash', status: 'paid' });
+  assert.equal(r2.ok, false);
+  assert.equal(state.accounting.journals.length, 0);
+});
+
+test('postSupplierPayment rejects zero or negative amount', () => {
+  const state = baseState();
+  ensureAccounting(state);
+  const r1 = postSupplierPayment(state, { id: 'p-neg', date: '2026-11-02', amount: 0, method: 'Cash', supplierName: 'S1' });
+  assert.equal(r1.ok, false);
+  assert.match(r1.error, /amount required|amount/i);
+  const r2 = postSupplierPayment(state, { id: 'p-neg2', date: '2026-11-02', amount: -100, method: 'Cash', supplierName: 'S1' });
+  assert.equal(r2.ok, false);
+  assert.equal(state.accounting.journals.length, 0);
+});
+
+test('backfill reports errors for invalid transactions instead of silently succeeding', () => {
+  const state = baseState({
+    sales: [sale()],
+    metalManagement: { transactions: [
+      { id: 't-bad', date: '2026-11-07', type: 'PURCHASE', metal: 'Gold', value: 0, posted: true },
+      { id: 't-good', date: '2026-11-07', type: 'PURCHASE', metal: 'Gold', value: 50000, posted: true }
+    ] }
+  });
+  const result = backfill(state);
+  assert.equal(result.posted, 2);
+  assert.equal(result.skipped, 0);
+  const tb = trialBalance(state);
+  assert.equal(tb.balanced, true);
+});
+
+test('makeLine rejects both debit and credit on same line', () => {
+  assert.throws(() => makeLine('1000', 100, 100), /cannot have both debit and credit/);
+  assert.throws(() => makeLine('1000', 0, 0), /cannot be zero|zero-value/);
+});
+
+test('validateLines rejects empty or single-line entries', () => {
+  const r1 = validateLines([]);
+  assert.equal(r1.ok, false);
+  assert.match(r1.error, /At least two lines/);
+  const r2 = validateLines([makeLine('1000', 100)]);
+  assert.equal(r2.ok, false);
+  assert.match(r2.error, /At least two lines/);
+});
+
+test('postOpeningBalances auto-balances unbalanced lines with equity plug', () => {
+  const state = baseState();
+  ensureAccounting(state);
+  const r = postOpeningBalances(state, {
+    date: '2026-07-16', fiscalYearId: 'FY-AUTO',
+    lines: [
+      { account: '1000', debit: 100, credit: 0 },
+      { account: '1200', debit: 200, credit: 0 }
+    ]
+  });
+  assert.equal(r.ok, true);
+  const tb = trialBalance(state);
+  assert.equal(tb.balanced, true);
+  const equity = state.accounting.lines.filter(l => l.account === '3200').reduce((s, l) => s + l.credit - l.debit, 0);
+  assert.equal(equity, 300);
 });

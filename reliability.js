@@ -30,17 +30,38 @@
     }
   }
 
+  let _lastPersistError = null;
+
   function saveState(state) {
     try {
       localStorage.setItem(DATA_KEY, JSON.stringify(state));
+      _lastPersistError = null;
     } catch (e) {
       console.error('Save state error:', e);
+      if (_lastPersistError !== e.message) {
+        _lastPersistError = e.message;
+        showNotification(tr('Data save failed. Changes may not be persisted.'), 'error');
+      }
     }
   }
 
   function num(x) { return Number(x || 0); }
   function rnd(n) { return Math.round((n + Number.EPSILON) * 100) / 100; }
   function esc(x) { return String(x ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+  // Prototype pollution guard: strip dangerous keys from user-controlled objects
+  const DANGEROUS_KEYS=new Set(['__proto__','constructor','prototype']);
+  function sanitizeObject(obj){
+    if(obj===null||obj===undefined) return obj;
+    if(Array.isArray(obj)) return obj.map(sanitizeObject);
+    if(typeof obj!=='object') return obj;
+    const clean={};
+    for(const [k,v] of Object.entries(obj)){
+      if(DANGEROUS_KEYS.has(k)) continue;
+      clean[k]=sanitizeObject(v);
+    }
+    return clean;
+  }
 
   // Localization bridge (filled by src.js once i18n is loaded)
   const tr = (msg) => {
@@ -137,48 +158,410 @@
   };
 
   const DEFAULT_USERS = [
-    { username: 'admin', passwordHash: hashPassword('admin123'), role: ROLES.ADMIN, name: 'Administrator', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true },
-    { username: 'manager', passwordHash: hashPassword('manager123'), role: ROLES.MANAGER, name: 'Store Manager', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true },
-    { username: 'sales', passwordHash: hashPassword('sales123'), role: ROLES.SALES, name: 'Sales Staff', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true },
-    { username: 'production', passwordHash: hashPassword('prod123'), role: ROLES.PRODUCTION, name: 'Production Head', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true },
-    { username: 'accountant', passwordHash: hashPassword('account123'), role: ROLES.ACCOUNTANT, name: 'Accountant', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true },
-    { username: 'viewer', passwordHash: hashPassword('viewer123'), role: ROLES.VIEWER, name: 'Viewer', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true }
+    { username: 'admin', password: 'admin123', role: ROLES.ADMIN, name: 'Administrator', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true },
+    { username: 'manager', password: 'manager123', role: ROLES.MANAGER, name: 'Store Manager', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true },
+    { username: 'sales', password: 'sales123', role: ROLES.SALES, name: 'Sales Staff', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true },
+    { username: 'production', password: 'prod123', role: ROLES.PRODUCTION, name: 'Production Head', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true },
+    { username: 'accountant', password: 'account123', role: ROLES.ACCOUNTANT, name: 'Accountant', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true },
+    { username: 'viewer', password: 'viewer123', role: ROLES.VIEWER, name: 'Viewer', email: '', active: true, createdAt: new Date().toISOString(), lastLogin: null, mustChangePassword: true }
   ];
 
   // ============================================================
   // AUTH UTILITIES
   // ============================================================
-  function hashPassword(password) {
-    let hash = 0;
+  // ============================================================
+  // PASSWORD HASHING (PBKDF2-SHA256 via Web Crypto API)
+  // ============================================================
+  const PBKDF2_ITERATIONS = 100000;
+  const HASH_ALG = 'SHA-256';
+  const KEY_LENGTH = 256;
+  const SALT_BYTES = 16;
+
+  function toBase64(bytes) {
+    const bin = String.fromCharCode(...bytes);
+    return btoa(bin);
+  }
+
+  function fromBase64(str) {
+    const bin = atob(str);
+    return Uint8Array.from(bin, c => c.charCodeAt(0));
+  }
+
+  // Constant-time comparison to prevent timing side-channels
+  function timingSafeEqual(a, b) {
+    if (a.length !== b.length) return false;
+    let result = 0;
+    for (let i = 0; i < a.length; i++) {
+      result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+    return result === 0;
+  }
+
+  function timingSafeEqualBytes(a, b) {
+    if (a.length !== b.length) return false;
+    let result = 0;
+    for (let i = 0; i < a.length; i++) {
+      result |= a[i] ^ b[i];
+    }
+    return result === 0;
+  }
+
+  async function hashPassword(password) {
+    if (!password || typeof password !== 'string') {
+      throw new Error('Password is required');
+    }
+    const encoder = new TextEncoder();
+    const salt = crypto.getRandomValues(new Uint8Array(SALT_BYTES));
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw', encoder.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']
+    );
+    const bits = await crypto.subtle.deriveBits(
+      { name: 'PBKDF2', salt, iterations: PBKDF2_ITERATIONS, hash: HASH_ALG },
+      keyMaterial,
+      KEY_LENGTH
+    );
+    return `pbkdf2:${PBKDF2_ITERATIONS}:${toBase64(salt)}:${toBase64(new Uint8Array(bits))}`;
+  }
+
+  // Verify legacy sha256: djb2 hash (for migration only)
+  function verifyLegacyHash(password, hash) {
+    let hashVal = 0;
     const salt = 'ratnaos-salt-2024';
     const str = salt + password;
     for (let i = 0; i < str.length; i++) {
       const char = str.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash;
+      hashVal = ((hashVal << 5) - hashVal) + char;
+      hashVal = hashVal & hashVal;
     }
-    return 'sha256:' + Math.abs(hash).toString(16).padStart(8, '0') + ':' + btoa(str).slice(0, 16);
+    const expected = 'sha256:' + Math.abs(hashVal).toString(16).padStart(8, '0') + ':' + btoa(str).slice(0, 16);
+    return timingSafeEqual(expected, hash);
   }
 
-  function verifyPassword(password, hash) {
-    return hashPassword(password) === hash;
+  async function verifyPassword(password, hash) {
+    if (!password || typeof password !== 'string') return false;
+    if (!hash || typeof hash !== 'string') return false;
+
+    if (hash.startsWith('pbkdf2:')) {
+      const parts = hash.split(':');
+      if (parts.length !== 4) return false;
+      const iterations = parseInt(parts[1], 10);
+      if (!iterations || iterations < 10000) return false;
+      let salt;
+      try {
+        salt = fromBase64(parts[2]);
+      } catch {
+        return false;
+      }
+      const encoder = new TextEncoder();
+      const keyMaterial = await crypto.subtle.importKey(
+        'raw', encoder.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']
+      );
+      const bits = await crypto.subtle.deriveBits(
+        { name: 'PBKDF2', salt, iterations, hash: HASH_ALG },
+        keyMaterial,
+        KEY_LENGTH
+      );
+      let expectedHash;
+      try {
+        expectedHash = fromBase64(parts[3]);
+      } catch {
+        return false;
+      }
+      return timingSafeEqualBytes(new Uint8Array(bits), expectedHash);
+    }
+
+    if (hash.startsWith('sha256:')) {
+      // Legacy format - verify then caller should rehash
+      return verifyLegacyHash(password, hash);
+    }
+
+    return false;
   }
 
-  function generateToken() {
-    return crypto.randomUUID() + '.' + Date.now().toString(36);
+  async function migrateLegacyHashes() {
+    let migrated = false;
+    for (const user of authState.users || []) {
+      if (user.passwordHash && user.passwordHash.startsWith('sha256:')) {
+        user.legacyHash = true;
+        user.mustChangePassword = true;
+        migrated = true;
+      }
+    }
+    if (migrated) await saveAuth();
+    return migrated;
   }
 
-  function parseToken(token) {
+  async function hashDefaultUsers() {
+    const users = [];
+    for (const u of DEFAULT_USERS) {
+      users.push({
+        ...u,
+        passwordHash: await hashPassword(u.password),
+        mustChangePassword: true
+      });
+    }
+    return users;
+  }
+
+  // ============================================================
+  // SESSION TOKEN SIGNING (HMAC-SHA256)
+  // ============================================================
+  // Session tokens are cryptographically signed to prevent forgery.
+  // Token format: uuid.timestamp.base64url(hmac_sha256(uuid.timestamp))
+  // A signing key is generated once and persisted in localStorage.
+  // Legacy unsigned tokens (uuid.timestamp) are rejected.
+  const SIGNING_KEY_KEY = 'ratnaos-signing-key';
+  let _signingKey = null;
+
+  async function getOrCreateSigningKey() {
+    if (_signingKey) return _signingKey;
+    try {
+      const stored = localStorage.getItem(SIGNING_KEY_KEY);
+      let keyData;
+      if (stored) {
+        keyData = Uint8Array.from(atob(stored), c => c.charCodeAt(0));
+      } else {
+        keyData = crypto.getRandomValues(new Uint8Array(32));
+        localStorage.setItem(SIGNING_KEY_KEY, btoa(String.fromCharCode(...keyData)));
+      }
+      _signingKey = await crypto.subtle.importKey(
+        'raw', keyData, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']
+      );
+      return _signingKey;
+    } catch (e) {
+      console.error('Signing key init error:', e);
+      return null;
+    }
+  }
+
+  async function generateToken() {
+    const key = await getOrCreateSigningKey();
+    const uuid = crypto.randomUUID();
+    const timestamp = Date.now().toString(36);
+    const payload = uuid + '.' + timestamp;
+    if (!key) return payload; // fallback: unsigned (should not happen)
+    const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payload));
+    const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)));
+    return payload + '.' + sigB64;
+  }
+
+  async function parseToken(token) {
     if (!token) return null;
     const parts = token.split('.');
-    if (parts.length !== 2) return null;
-    return { uuid: parts[0], timestamp: parseInt(parts[1], 36) };
+    if (parts.length === 2) {
+      // Legacy unsigned token — reject
+      return null;
+    }
+    if (parts.length !== 3) return null;
+    const [uuid, timestampStr, sigB64] = parts;
+    const payload = uuid + '.' + timestampStr;
+    const key = await getOrCreateSigningKey();
+    if (!key) return null;
+    try {
+      const sigData = Uint8Array.from(atob(sigB64), c => c.charCodeAt(0));
+      const valid = await crypto.subtle.verify('HMAC', key, sigData, new TextEncoder().encode(payload));
+      if (!valid) return null;
+      return { uuid, timestamp: parseInt(timestampStr, 36) };
+    } catch {
+      return null;
+    }
   }
 
-  function isTokenValid(token) {
-    const parsed = parseToken(token);
+  async function isTokenValid(token) {
+    const parsed = await parseToken(token);
     if (!parsed) return false;
     return (Date.now() - parsed.timestamp) < SESSION_TIMEOUT_MS;
+  }
+
+  // ============================================================
+  // AUTH DATA ENCRYPTION (AES-GCM)
+  // ============================================================
+  // Auth state stored in localStorage is encrypted with AES-GCM.
+  // A 256-bit key is generated once and persisted in localStorage.
+  // Each encryption uses a random 96-bit IV; IV is stored with ciphertext.
+  // Legacy plaintext data is detected and re-encrypted on next save.
+  const ENC_KEY_KEY = 'ratnaos-auth-enc-key';
+  let _encKey = null;
+
+  async function getOrCreateEncKey() {
+    if (_encKey) return _encKey;
+    try {
+      const stored = localStorage.getItem(ENC_KEY_KEY);
+      let keyData;
+      if (stored) {
+        keyData = Uint8Array.from(atob(stored), c => c.charCodeAt(0));
+      } else {
+        keyData = crypto.getRandomValues(new Uint8Array(32));
+        localStorage.setItem(ENC_KEY_KEY, btoa(String.fromCharCode(...keyData)));
+      }
+      _encKey = await crypto.subtle.importKey(
+        'raw', keyData, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']
+      );
+      return _encKey;
+    } catch (e) {
+      console.error('Encryption key init error:', e);
+      return null;
+    }
+  }
+
+  async function encryptAuthData(plaintextObj) {
+    const key = await getOrCreateEncKey();
+    if (!key) return JSON.stringify(plaintextObj); // fallback: plaintext
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const plaintext = new TextEncoder().encode(JSON.stringify(plaintextObj));
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: iv }, key, plaintext
+    );
+    return JSON.stringify({
+      iv: btoa(String.fromCharCode(...iv)),
+      ciphertext: btoa(String.fromCharCode(...new Uint8Array(ciphertext)))
+    });
+  }
+
+  async function decryptAuthData(encryptedStr) {
+    try {
+      const parsed = JSON.parse(encryptedStr);
+      if (!parsed.iv || !parsed.ciphertext) {
+        // Legacy plaintext format — return as-is for parsing
+        return encryptedStr;
+      }
+      const key = await getOrCreateEncKey();
+      if (!key) return encryptedStr;
+      const iv = Uint8Array.from(atob(parsed.iv), c => c.charCodeAt(0));
+      const ciphertext = Uint8Array.from(atob(parsed.ciphertext), c => c.charCodeAt(0));
+      const decrypted = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: iv }, key, ciphertext
+      );
+      return new TextDecoder().decode(decrypted);
+    } catch {
+      return encryptedStr; // return as-is, caller will handle parse failure
+    }
+  }
+
+  // ============================================================
+  // CSRF TOKEN (defense-in-depth for bearer-token SPA)
+  // ============================================================
+  // No cookie-based auth exists, so traditional cookie-autosubmit CSRF
+  // does not apply. A CSRF token is still generated per session to protect
+  // same-origin forged requests and to provide a validation hook for any
+  // future backend API calls. The token is stored in sessionStorage (not
+  // accessible cross-origin) and compared using timing-safe comparison.
+  const CSRF_KEY = 'ratnaos-csrf';
+
+  function generateCsrfToken() {
+    return crypto.randomUUID();
+  }
+
+  function getCsrfToken() {
+    try {
+      const stored = sessionStorage.getItem(CSRF_KEY);
+      if (stored) return stored;
+      const token = generateCsrfToken();
+      sessionStorage.setItem(CSRF_KEY, token);
+      return token;
+    } catch {
+      return generateCsrfToken();
+    }
+  }
+
+  function validateCsrfToken(token) {
+    if (!token || typeof token !== 'string') return false;
+    const expected = getCsrfToken();
+    return timingSafeEqual(token, expected);
+  }
+
+  function rotateCsrfToken() {
+    const token = generateCsrfToken();
+    try { sessionStorage.setItem(CSRF_KEY, token); } catch {}
+    return token;
+  }
+
+  // ============================================================
+  // LOGIN RATE LIMITING / BRUTE FORCE PROTECTION
+  // ============================================================
+  const RATE_LIMIT_KEY = 'ratnaos-auth-rate-limit';
+  const MAX_FAILED_ATTEMPTS = 5;
+  const LOCKOUT_DURATION_MS = 15 * 60 * 1000;
+  const WINDOW_DURATION_MS = 15 * 60 * 1000;
+
+  let rateLimitState = {};
+
+  function loadRateLimitState() {
+    try {
+      const stored = localStorage.getItem(RATE_LIMIT_KEY);
+      if (stored) {
+        rateLimitState = sanitizeObject(JSON.parse(stored));
+      }
+    } catch {
+      rateLimitState = {};
+    }
+  }
+
+  function saveRateLimitState() {
+    try {
+      localStorage.setItem(RATE_LIMIT_KEY, JSON.stringify(rateLimitState));
+    } catch {
+      console.error('Failed to persist rate limit state');
+    }
+  }
+
+  function cleanupStaleEntries(username) {
+    const now = Date.now();
+    const entries = rateLimitState[username];
+    if (!entries) return;
+    rateLimitState[username] = entries.filter(
+      e => now - e.timestamp < WINDOW_DURATION_MS
+    );
+    if (rateLimitState[username].length === 0) {
+      delete rateLimitState[username];
+    }
+  }
+
+  function isLockedOut(username) {
+    cleanupStaleEntries(username);
+    const entries = rateLimitState[username];
+    if (!entries || entries.length < MAX_FAILED_ATTEMPTS) return false;
+    const oldestInWindow = entries[entries.length - MAX_FAILED_ATTEMPTS].timestamp;
+    return (Date.now() - oldestInWindow) < LOCKOUT_DURATION_MS;
+  }
+
+  function recordFailedAttempt(username) {
+    const now = Date.now();
+    if (!rateLimitState[username]) rateLimitState[username] = [];
+    rateLimitState[username].push({ timestamp: now, reason: 'failed_login' });
+    cleanupStaleEntries(username);
+    saveRateLimitState();
+    logAudit('AUTH_RATE_LIMIT', `Failed login attempt recorded for user: ${username}`, {
+      attempts: rateLimitState[username]?.length || 0,
+      lockedOut: isLockedOut(username)
+    });
+  }
+
+  function recordSuccessfulLogin(username) {
+    if (rateLimitState[username]) {
+      delete rateLimitState[username];
+      saveRateLimitState();
+      logAudit('AUTH_RATE_LIMIT_RESET', `Rate limit cleared for user: ${username} after successful login`);
+    }
+  }
+
+  function getRateLimitStatus(username) {
+    cleanupStaleEntries(username);
+    const entries = rateLimitState[username];
+    if (!entries || entries.length === 0) {
+      return { attempts: 0, maxAttempts: MAX_FAILED_ATTEMPTS, lockedOut: false, remaining: MAX_FAILED_ATTEMPTS };
+    }
+    const attempts = entries.length;
+    const lockedOut = isLockedOut(username);
+    const remaining = Math.max(0, MAX_FAILED_ATTEMPTS - attempts);
+    return { attempts, maxAttempts: MAX_FAILED_ATTEMPTS, lockedOut, remaining };
+  }
+
+  function clearRateLimit(username) {
+    if (rateLimitState[username]) {
+      delete rateLimitState[username];
+      saveRateLimitState();
+    }
   }
 
   // ============================================================
@@ -195,55 +578,71 @@
   // ============================================================
   // AUTHENTICATION FUNCTIONS
   // ============================================================
-  function initAuth() {
+  async function initAuth() {
     try {
+      loadRateLimitState();
       const stored = localStorage.getItem(AUTH_KEY);
       if (stored) {
-        const data = JSON.parse(stored);
+        const decrypted = await decryptAuthData(stored);
+        const data = sanitizeObject(JSON.parse(decrypted));
         if (data.users) {
           authState.users = data.users;
+          // Re-encrypt if data was legacy plaintext format
+          if (!stored.includes('"iv"') && !stored.includes('"ciphertext"')) {
+            await saveAuth();
+          }
+          await migrateLegacyHashes();
         } else {
-          authState.users = DEFAULT_USERS;
-          saveAuth();
+          authState.users = await hashDefaultUsers();
+          await saveAuth();
         }
       } else {
-        authState.users = DEFAULT_USERS;
-        saveAuth();
+        authState.users = await hashDefaultUsers();
+        await saveAuth();
       }
 
       const sessionToken = sessionStorage.getItem('ratnaos-session');
-      if (sessionToken && isTokenValid(sessionToken)) {
+      if (sessionToken && await isTokenValid(sessionToken)) {
         const user = authState.users.find(u => u.token === sessionToken);
         if (user && user.active) {
-          loginUser(user, sessionToken, false);
+          await loginUser(user, sessionToken, false);
         }
       }
     } catch (e) {
       console.error('Auth init error:', e);
-      authState.users = DEFAULT_USERS;
-      saveAuth();
+      authState.users = await hashDefaultUsers();
+      await saveAuth();
     }
   }
 
-  function saveAuth() {
+  let _lastAuthSaveError = null;
+  async function saveAuth() {
     try {
-      localStorage.setItem(AUTH_KEY, JSON.stringify({ users: authState.users }));
+      const encrypted = await encryptAuthData({ users: authState.users });
+      localStorage.setItem(AUTH_KEY, encrypted);
+      _lastAuthSaveError = null;
     } catch (e) {
       console.error('Auth save error:', e);
+      if (_lastAuthSaveError !== e.message) {
+        _lastAuthSaveError = e.message;
+        showNotification(tr('Authentication state save failed.'), 'error');
+      }
     }
   }
 
-  function loginUser(user, token, persist = true) {
+  async function loginUser(user, token, persist = true) {
     authState.currentUser = user;
     authState.token = token;
     authState.isAuthenticated = true;
     authState.permissions = getPermissionsForRole(user.role);
     user.lastLogin = new Date().toISOString();
     user.token = token;
-    saveAuth();
+    await saveAuth();
     if (persist) {
       sessionStorage.setItem('ratnaos-session', token);
     }
+    // Ensure a CSRF token exists for the authenticated session
+    getCsrfToken();
     logAudit('AUTH_LOGIN', `User ${user.username} logged in as ${user.role}`);
     return true;
   }
@@ -257,39 +656,56 @@
     authState.isAuthenticated = false;
     authState.permissions = [];
     sessionStorage.removeItem('ratnaos-session');
+    try { sessionStorage.removeItem(CSRF_KEY); } catch {}
   }
 
-  function authenticate(username, password) {
+  async function authenticate(username, password) {
+    if (isLockedOut(username)) {
+      logAudit('AUTH_RATE_LIMITED', `Login blocked for user: ${username} - account locked out`);
+      return { success: false, error: 'Account temporarily locked due to multiple failed login attempts. Try again later.' };
+    }
     const user = authState.users.find(u => u.username === username && u.active);
     if (!user) {
+      recordFailedAttempt(username);
       logAudit('AUTH_FAILED', `Login failed for username: ${username} - user not found`);
       return { success: false, error: tr('Invalid username or password') };
     }
-    if (!verifyPassword(password, user.passwordHash)) {
+    const valid = await verifyPassword(password, user.passwordHash);
+    if (!valid) {
+      recordFailedAttempt(username);
       logAudit('AUTH_FAILED', `Login failed for username: ${username} - invalid password`);
       return { success: false, error: tr('Invalid username or password') };
     }
-    const token = generateToken();
-    return loginUser(user, token) ? { success: true, user, mustChangePassword: user.mustChangePassword } : { success: false, error: 'Login failed' };
+    // Rehash legacy passwords on successful login
+    if (user.passwordHash.startsWith('sha256:')) {
+      user.passwordHash = await hashPassword(password);
+      user.legacyHash = false;
+      saveAuth();
+      logAudit('PASSWORD_MIGRATED', `Password rehashed for user: ${username}`);
+    }
+    recordSuccessfulLogin(username);
+    const token = await generateToken();
+    return await loginUser(user, token) ? { success: true, user, mustChangePassword: user.mustChangePassword } : { success: false, error: 'Login failed' };
   }
 
-  function changePassword(username, oldPassword, newPassword) {
+  async function changePassword(username, oldPassword, newPassword) {
     const user = authState.users.find(u => u.username === username);
     if (!user) return { success: false, error: tr('User not found') };
-    if (!verifyPassword(oldPassword, user.passwordHash)) {
+    if (!await verifyPassword(oldPassword, user.passwordHash)) {
       return { success: false, error: 'Current password is incorrect' };
     }
     if (newPassword.length < 8) {
       return { success: false, error: 'Password must be at least 8 characters' };
     }
-    user.passwordHash = hashPassword(newPassword);
+    user.passwordHash = await hashPassword(newPassword);
+    user.legacyHash = false;
     user.mustChangePassword = false;
-    saveAuth();
+    await saveAuth();
     logAudit('PASSWORD_CHANGE', `Password changed for user: ${username}`);
     return { success: true };
   }
 
-  function createUser(username, password, role, name, email) {
+  async function createUser(username, password, role, name, email) {
     if (!hasPermission('settings:user-management')) {
       return { success: false, error: 'Insufficient permissions' };
     }
@@ -301,7 +717,7 @@
     }
     const user = {
       username,
-      passwordHash: hashPassword(password),
+      passwordHash: await hashPassword(password),
       role,
       name,
       email: email || '',
@@ -311,12 +727,12 @@
       mustChangePassword: true
     };
     authState.users.push(user);
-    saveAuth();
+    await saveAuth();
     logAudit('USER_CREATED', `User ${username} created with role ${role} by ${authState.currentUser?.username}`);
     return { success: true, user };
   }
 
-  function updateUser(username, updates) {
+  async function updateUser(username, updates) {
     if (!hasPermission('settings:user-management')) {
       return { success: false, error: 'Insufficient permissions' };
     }
@@ -325,13 +741,13 @@
     if (updates.role && !Object.values(ROLES).includes(updates.role)) {
       return { success: false, error: tr('Invalid role') };
     }
-    Object.assign(user, updates);
-    saveAuth();
+    Object.assign(user, sanitizeObject(updates));
+    await saveAuth();
     logAudit('USER_UPDATED', `User ${username} updated by ${authState.currentUser?.username}`, updates);
     return { success: true, user };
   }
 
-  function deleteUser(username) {
+  async function deleteUser(username) {
     if (!hasPermission('settings:user-management')) {
       return { success: false, error: 'Insufficient permissions' };
     }
@@ -341,7 +757,7 @@
     const idx = authState.users.findIndex(u => u.username === username);
     if (idx === -1) return { success: false, error: 'User not found' };
     authState.users.splice(idx, 1);
-    saveAuth();
+    await saveAuth();
     logAudit('USER_DELETED', `User ${username} deleted by ${authState.currentUser?.username}`);
     return { success: true };
   }
@@ -650,36 +1066,8 @@
 
   // ============================================================
   // DUPLICATE TRANSACTION PREVENTION
+  // Enhanced persistent version defined later (after IdempotencyStore)
   // ============================================================
-  const TransactionRegistry = {
-    pending: new Map(),
-
-    generateKey(type, data) {
-      const keyParts = [
-        type,
-        data.metal || '',
-        data.purity || '',
-        data.weight || '',
-        data.rate || '',
-        data.date || new Date().toISOString().slice(0, 10),
-        data.reference || '',
-        data.karigar || '',
-        data.jobCode || '',
-        data.customer || ''
-      ];
-      return keyParts.join('|');
-    },
-
-    checkAndRegister(type, data) {
-      const key = this.generateKey(type, data);
-      if (this.pending.has(key)) {
-        throw new DuplicateTransactionError('Duplicate transaction detected');
-      }
-      this.pending.set(key, Date.now());
-      setTimeout(() => this.pending.delete(key), 5000);
-      return key;
-    }
-  };
 
   // ============================================================
   // STOCK UPDATE VALIDATION
@@ -708,8 +1096,231 @@
         throw new MetalBalanceError('Return weight exceeds issued weight');
       }
       return true;
+    },
+
+    // Atomic check-and-deduct: validates stock and marks item sold in one locked operation.
+    // Returns the updated item or throws if insufficient stock.
+    validateAndDeductItem(itemId, qty, weight) {
+      const state = getState();
+      const item = state.items?.find(i => i.id === itemId);
+      if (!item) throw new AppError('Item not found', 'ITEM_NOT_FOUND');
+      if (item.status !== 'stock') throw new InsufficientStockError('Item not in stock');
+      const available = num(item.netWeight ?? item.weight);
+      if (weight > available) {
+        throw new InsufficientStockError(`Insufficient stock: ${available}g available, ${weight}g requested`);
+      }
+      item.status = 'sold';
+      item.updatedAt = new Date().toISOString();
+      saveState(state);
+      return item;
     }
   };
+
+  // ============================================================
+  // CONCURRENCY CONTROL: TRANSACTION LOCK (async mutex)
+  // ============================================================
+  // Single-file PWA uses localStorage; there is no DB transaction layer.
+  // A reentrant async mutex serializes all mutating operations so that
+  // check-then-act sequences (stock validation + deduction, balance read + write)
+  // cannot interleave across concurrent callers.
+  class TransactionLock {
+    constructor() {
+      this._queue = Promise.resolve();
+      this._locked = false;
+    }
+
+    async acquire() {
+      let release;
+      const locked = new Promise((res) => { release = res; });
+      // Wait for previous holder to release, then signal we hold the lock.
+      // The next acquire() will wait on this `locked` promise.
+      const waitForPrevious = this._queue;
+      this._queue = locked;
+      await waitForPrevious;
+      this._locked = true;
+      return () => { this._locked = false; release(); };
+    }
+  }
+
+  const txnLock = new TransactionLock();
+
+  // ============================================================
+  // IDEMPOTENCY STORE (persisted to localStorage)
+  // ============================================================
+  // Records processed idempotency keys so retried operations are not
+  // applied twice. Keys expire after IDEMPOTENCY_TTL_MS.
+  const IDEMPOTENCY_KEY = 'ratnaos-idempotency';
+  const IDEMPOTENCY_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+  function loadIdempotencyStore() {
+    try {
+      const raw = localStorage.getItem(IDEMPOTENCY_KEY);
+      if (!raw) return {};
+      const data = JSON.parse(raw);
+      const now = Date.now();
+      const cleaned = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (now - v < IDEMPOTENCY_TTL_MS) cleaned[k] = v;
+      }
+      return cleaned;
+    } catch {
+      return {};
+    }
+  }
+
+  let idempotencyStore = loadIdempotencyStore();
+
+  function saveIdempotencyStore() {
+    try {
+      localStorage.setItem(IDEMPOTENCY_KEY, JSON.stringify(idempotencyStore));
+    } catch (e) {
+      console.error('Idempotency store save error:', e);
+    }
+  }
+
+  function idempotencyHas(key) {
+    return !!idempotencyStore[key];
+  }
+
+  function idempotencyRecord(key) {
+    idempotencyStore[key] = Date.now();
+    saveIdempotencyStore();
+  }
+
+  function idempotencyCleanup() {
+    const now = Date.now();
+    let changed = false;
+    for (const [k, v] of Object.entries(idempotencyStore)) {
+      if (now - v >= IDEMPOTENCY_TTL_MS) {
+        delete idempotencyStore[k];
+        changed = true;
+      }
+    }
+    if (changed) saveIdempotencyStore();
+  }
+
+  // ============================================================
+  // ENHANCED TRANSACTION REGISTRY (persistent duplicate prevention)
+  // ============================================================
+  const DUPLICATE_KEY = 'ratnaos-duplicates';
+  const DUPLICATE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+  function loadDuplicateRegistry() {
+    try {
+      const raw = localStorage.getItem(DUPLICATE_KEY);
+      if (!raw) return {};
+      const data = JSON.parse(raw);
+      const now = Date.now();
+      const cleaned = {};
+      for (const [k, v] of Object.entries(data)) {
+        if (now - v < DUPLICATE_TTL_MS) cleaned[k] = v;
+      }
+      return cleaned;
+    } catch {
+      return {};
+    }
+  }
+
+  let duplicateRegistry = loadDuplicateRegistry();
+
+  function saveDuplicateRegistry() {
+    try {
+      localStorage.setItem(DUPLICATE_KEY, JSON.stringify(duplicateRegistry));
+    } catch (e) {
+      console.error('Duplicate registry save error:', e);
+    }
+  }
+
+  function duplicateHas(key) {
+    return !!duplicateRegistry[key];
+  }
+
+  function duplicateRegister(key) {
+    duplicateRegistry[key] = Date.now();
+    saveDuplicateRegistry();
+    setTimeout(() => {
+      delete duplicateRegistry[key];
+      saveDuplicateRegistry();
+    }, DUPLICATE_TTL_MS);
+  }
+
+  const TransactionRegistry = {
+    pending: new Map(),
+
+    generateKey(type, data) {
+      const keyParts = [
+        type,
+        data.metal || '',
+        data.purity || '',
+        data.weight || '',
+        data.rate || '',
+        data.date || new Date().toISOString().slice(0, 10),
+        data.reference || '',
+        data.karigar || '',
+        data.jobCode || '',
+        data.customer || ''
+      ];
+      return keyParts.join('|');
+    },
+
+    checkAndRegister(type, data) {
+      const key = this.generateKey(type, data);
+      if (this.pending.has(key) || duplicateHas(key)) {
+        throw new DuplicateTransactionError('Duplicate transaction detected');
+      }
+      this.pending.set(key, Date.now());
+      duplicateRegister(key);
+      setTimeout(() => {
+        this.pending.delete(key);
+      }, 5000);
+      return key;
+    }
+  };
+
+  // ============================================================
+  // ATOMIC OPERATION WRAPPER
+  // ============================================================
+  // Executes fn inside the transaction lock with idempotency protection.
+  // If the idempotency key was already processed, returns the cached result
+  // instead of re-executing. fn should return { success, ... } or throw.
+  const _idempotencyResults = new Map();
+
+  async function atomicOperation(idempotencyKey, fn) {
+    if (!idempotencyKey) {
+      throw new Error('Idempotency key required for atomic operation');
+    }
+
+    // Fast path: already processed in this session
+    if (idempotencyHas(idempotencyKey)) {
+      const cached = _idempotencyResults.get(idempotencyKey);
+      if (cached) return { ...cached, _idempotent: true };
+      return { success: true, _idempotent: true };
+    }
+
+    if (duplicateHas(idempotencyKey)) {
+      return { success: true, _idempotent: true };
+    }
+
+    const release = await txnLock.acquire();
+    try {
+      // Re-check after acquiring lock (another caller may have processed it)
+      if (idempotencyHas(idempotencyKey)) {
+        const cached = _idempotencyResults.get(idempotencyKey);
+        if (cached) return { ...cached, _idempotent: true };
+        return { success: true, _idempotent: true };
+      }
+
+      const result = await fn();
+
+      idempotencyRecord(idempotencyKey);
+      if (result && typeof result === 'object') {
+        _idempotencyResults.set(idempotencyKey, result);
+      }
+      return result;
+    } finally {
+      release();
+    }
+  }
 
   // ============================================================
   // BACKUP MANAGER
@@ -983,8 +1594,8 @@
   // ============================================================
   // INITIALIZATION
   // ============================================================
-  function initReliability() {
-    initAuth();
+  async function initReliability() {
+    await initAuth();
     BackupManager.init();
 
     DataRecovery.runIntegrityCheck().then(result => {
@@ -1047,9 +1658,22 @@
         createUser,
         updateUser,
         deleteUser,
+        listUsers: () => (authState.users || []).map(u => ({
+          id: u.username,
+          username: u.username,
+          name: u.name || u.username,
+          email: u.email || '',
+          role: u.role,
+          active: u.active,
+          lastLogin: u.lastLogin
+        })),
         getCurrentUser: () => authState.currentUser,
         isAuthenticated: () => authState.isAuthenticated,
-        hasPermission
+        hasPermission,
+        hashPassword,
+        verifyPassword,
+        rateLimitStatus: getRateLimitStatus,
+        clearRateLimit
       },
       validate: Validators,
       schemas: ValidationSchemas,
@@ -1069,7 +1693,15 @@
         log: logAudit,
         getCategory: categorizeEvent
       },
-      showNotification
+      showNotification,
+      atomicOperation,
+      idempotencyHas,
+      csrf: {
+        generate: generateCsrfToken,
+        token: getCsrfToken,
+        validate: validateCsrfToken,
+        rotate: rotateCsrfToken
+      }
     };
 
     logAudit('SYSTEM_INIT', 'Reliability module initialized');

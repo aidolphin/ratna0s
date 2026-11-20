@@ -536,3 +536,24 @@ export function ringSizeToCircumference(size, system = 'us') {
   const row = RING_SIZE_TABLE.find(r => String(r[system]).toUpperCase() === normalized);
   return row ? row.circ : null;
 }
+
+export const KNOWLEDGE_DATA = {
+  formulas: {
+    metalCost: { name: 'Metal Cost', description: 'Calculate metal cost based on weight and rate', formula: 'metalCost = netWeight × ratePerGram', example: '10g × 15000 = 150000', variables: { netWeight: 'Net weight in grams', ratePerGram: 'Rate per gram' } },
+    wastage: { name: 'Wastage Calculation', description: 'Calculate wastage weight and value', formula: 'wastageWeight = netWeight × wastagePercent / 100', example: '10g × 2% = 0.2g', variables: { netWeight: 'Net weight', wastagePercent: 'Wastage percentage' } },
+    makingCharge: { name: 'Making Charge', description: 'Calculate making charges', formula: 'makingCharge = netWeight × makingRate', example: '10g × 500 = 5000', variables: { netWeight: 'Net weight', makingRate: 'Making rate per gram' } },
+    stoneCost: { name: 'Stone Cost', description: 'Calculate stone cost', formula: 'stoneCost = caratWeight × ratePerCarat + settingCost', example: '1.5ct × 50000 + 2000 = 77000', variables: { caratWeight: 'Stone weight in carats', ratePerCarat: 'Rate per carat', settingCost: 'Setting cost' } },
+  },
+  hallmarks: [
+    { country: 'India', authority: 'BIS', mark: 'BIS', purity: 'All', mandatory: true },
+    { country: 'Nepal', authority: 'Department of Mines', mark: 'Nepal', purity: 'All', mandatory: false },
+  ],
+  terminology: [
+    { term: 'Karat', definition: 'Measure of gold purity (24K = pure gold)', category: 'Purity' },
+    { term: 'Tola', definition: 'Traditional weight unit (11.664g)', category: 'Weight' },
+    { term: 'Suki', definition: 'Nepali weight unit (1/4 tola = 2.916g)', category: 'Weight' },
+    { term: 'Wastage', definition: 'Metal loss during manufacturing', category: 'Production' },
+    { term: 'Making Charge', definition: 'Labour cost for jewellery fabrication', category: 'Production' },
+    { term: 'Hallmark', definition: 'Official stamp certifying metal purity', category: 'Quality' },
+  ],
+};

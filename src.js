@@ -24,18 +24,75 @@ import {
   prepareVatReturn, payVatPeriod, postTdsEntry, depositTds, tdsOutstanding, taxSummary,
   taxRegisterRows
 } from './tax.js';
+import {
+  calcItemCost, calcCartTotals as trustedCalcCartTotals, calcInvoiceTotal, calcExchangeValue,
+  calcJobFinancials, validateSaleFinancials, toMinorUnits, fromMinorUnits,
+  formatMinorUnits, roundWeight3, roundCurrency2, roundPercent4,
+  validatePurity, validateTaxRate, validateMetalRate, validateWeight,
+  validateMakingCharge, validateWastagePercent, CURRENCY_MINOR, WEIGHT_MILLI
+} from './financial.js';
+import {
+  JEWELRY_CATEGORIES, ITEM_CATEGORIES, PURITY_OPTIONS, METAL_TYPES, STONE_TYPES, STATUS_OPTIONS, LOCATIONS,
+  MOVEMENT_TYPES, MOVEMENT_REASONS, PAYMENT_METHODS,
+  METAL_TXN_TYPES, GOLD_PURITIES, SILVER_PURITIES, PLATINUM_PURITIES, METAL_UNITS,
+  JOB_STATUSES, JOB_STAGES, LABOUR_METHODS, KARIGAR_SPECIALTIES, QC_RESULTS, PRIORITY_OPTIONS,
+  JEWELRY_ICONS, NAV_ICONS, ICON_PATHS, EXPENSE_CATEGORIES, EXPENSE_STATUSES, _PAGE_TITLES,
+  METAL_TYPES_BY_CATEGORY, INCOME_CATEGORIES, TAX_TYPES,
+  PURITY_STANDARDS, GEMSTONE_TYPES, GEMSTONE_CUTS, GEMSTONE_CLARITY, GEMSTONE_COLORS, NEPALI_UNITS
+} from './constants.js';
 
 // Expose the translator so the classic reliability.js layer can localize its messages
 if(typeof window!=='undefined'){
   window.RatnaOS=window.RatnaOS||{};
   window.RatnaOS.t=t;
   window.RatnaOS.i18n={t,setLanguage,getLanguage,setCountry,getCountry,countryProfile,formatDate,formatDateTime,formatMoney,formatWeight,LOCALES,COUNTRIES};
+  // Wait for reliability.js to initialize (runs on DOMContentLoaded)
+  window.RatnaOS.ready = new Promise(resolve => {
+    if(window.RatnaOS.atomicOperation) return resolve();
+    const check = setInterval(() => {
+      if(window.RatnaOS.atomicOperation) {
+        clearInterval(check);
+        resolve();
+      }
+    }, 50);
+    // Fallback timeout
+    setTimeout(() => { clearInterval(check); resolve(); }, 5000);
+  });
 }
 
+// Pre-load all page modules at module level to avoid circular dependency issues
+const pageModules = {};
+const PAGE_MODULE_NAMES = ['dashboard','inventory','exchange','pos','karigar','production','metals','reports','accounting','tax','knowledge','suppliers','expenses','settings'];
+const preloadPageModules = (async () => {
+  await Promise.all(PAGE_MODULE_NAMES.map(async (name) => {
+    try {
+      const m = await import(`./pages/${name}.js`);
+      pageModules[name] = m.default;
+    } catch (e) {
+      console.error(`Failed to preload page module: ${name}`, e);
+    }
+  }));
+})();
+
 const KEY='ratnaos-pilot-v1';
+
+// Prototype pollution guard: strip dangerous keys from user-controlled objects
+const DANGEROUS_KEYS=new Set(['__proto__','constructor','prototype']);
+function sanitizeObject(obj){
+  if(obj===null||obj===undefined) return obj;
+  if(Array.isArray(obj)) return obj.map(sanitizeObject);
+  if(typeof obj!=='object') return obj;
+  const clean={};
+  for(const [k,v] of Object.entries(obj)){
+    if(DANGEROUS_KEYS.has(k)) continue;
+    clean[k]=sanitizeObject(v);
+  }
+  return clean;
+}
+
 const initial=()=>({rates:{gold:15000,silver:180},items:[],sales:[],exchanges:[],jobs:[],audit:[],materials:{metals:[],gemstones:[],consumables:[]},boms:[],metalIssues:[],stockMovements:[],customers:[],karigars:[],suppliers:[],expenses:[],metalManagement:{openingBalances:{},transactions:[],postedPeriods:[]},quotes:[],settings:{shop:'RatnaOS Jewellery',currency:'NPR',taxRate:13,taxLabel:'VAT',invoicePrefix:'INV',country:'NP',language:'en',taxInclusive:true,weightUnit:'tola',calendar:'bs',vatNumber:'',rateSync:{enabled:false,url:'',goldPath:'gold',silverPath:'silver',unit:'tola',lastSync:null,lastAttempt:null,lastStatus:'',lastMessage:''}}});
 let state;
-try{state=JSON.parse(localStorage.getItem(KEY))||initial()}catch{state=initial()}
+try{state=sanitizeObject(JSON.parse(localStorage.getItem(KEY)))||initial()}catch(err){state=initial();console.error('Boot state parse error:',err);}
 state.kcOverrides=state.kcOverrides||{};
 state.settings=state.settings||{};
 state.settings.confirmations=state.settings.confirmations||{};
@@ -60,6 +117,21 @@ const id=()=>crypto.randomUUID();
 const lt=v=>v?t(String(v)):'';
 const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const save=(event,detail)=>{state.audit.unshift({id:id(),date:new Date().toISOString(),event:t(event),detail});localStorage.setItem(KEY,JSON.stringify(state));render()};
+
+// Export state and utilities for page modules
+export { state, money, t, translateDigits, fmtDate, fmtDateTime, fmtLongDate, fmtWeight, fmtNum, num, rnd, id, lt, esc, save, PAGE_TITLES, NAV_ICONS, JOB_STAGES, JOB_STATUSES, LABOUR_METHODS, KARIGAR_SPECIALTIES, QC_RESULTS, PRIORITY_OPTIONS, JEWELRY_CATEGORIES, METAL_TYPES, METAL_TYPES_BY_CATEGORY, PURITY_OPTIONS, STONE_TYPES, STATUS_OPTIONS, LOCATIONS, MOVEMENT_TYPES, MOVEMENT_REASONS, PAYMENT_METHODS, METAL_TXN_TYPES, GOLD_PURITIES, SILVER_PURITIES, PLATINUM_PURITIES, METAL_UNITS, EXPENSE_CATEGORIES, EXPENSE_STATUSES, ICON_PATHS, JEWELRY_ICONS, PURITY_STANDARDS, GEMSTONE_TYPES, GEMSTONE_CUTS, GEMSTONE_CLARITY, GEMSTONE_COLORS, NEPALI_UNITS };
+const notify=(msg,type='success')=>window.RatnaOS?.showNotification?.(msg,type);
+function persistState(){
+  try{
+    localStorage.setItem(KEY,JSON.stringify(state));
+    return true;
+  }catch(err){
+    const msg=err&&err.message?String(err.message):String(err);
+    notify(t('Data save failed')+': '+msg,'error');
+    console.error('Persist state error:',err);
+    return false;
+  }
+}
 const stock=()=>state.items.filter(i=>i.status==='stock');
 const fine=i=>calcItem.fineWeight(i);
 const rateFor=i=>calcItem.metalRate(i);
@@ -74,107 +146,71 @@ const toGram=(v,unit)=>num(v)*num(UNITS[unit]||1);
 const fromGram=(v,unit)=>num(v)/num(UNITS[unit]||1);
 const convert=(v,from,to)=>fromGram(toGram(v,from),to);
 
-const JEWELRY_CATEGORIES = [
-  { id: 'ring', label: 'Rings', icon: 'ring', category: 'gold', subTypes: ['Engagement', 'Wedding', 'Eternity', 'Signet', 'Cocktail', 'Stackable', 'Promise', 'Midi'] },
-  { id: 'necklace', label: 'Necklaces', icon: 'necklace', category: 'gold', subTypes: ['Chain', 'Pendant', 'Choker', 'Collar', 'Opera', 'Lariat', 'Bib', 'Station'] },
-  { id: 'earring', label: 'Earrings', icon: 'earring', category: 'gold', subTypes: ['Stud', 'Hoop', 'Drop', 'Chandelier', 'Huggie', 'Cuff', 'Threader', 'Jacket'] },
-  { id: 'bracelet', label: 'Bracelets', icon: 'bracelet', category: 'gold', subTypes: ['Bangle', 'Cuff', 'Chain', 'Tennis', 'Charm', 'Link', 'Beaded', 'Slave'] },
-  { id: 'pendant', label: 'Pendants', icon: 'pendant', category: 'gold', subTypes: ['Solitaire', 'Halo', 'Cluster', 'Initial', 'Religious', 'Gemstone', 'Pearl', 'Locket'] },
-  { id: 'bangle', label: 'Bangles', icon: 'bangle', category: 'gold', subTypes: ['Solid', 'Hinged', 'Flexible', 'Diamond-cut', 'Enamel', 'Kundan', 'Polki', 'Temple'] },
-  { id: 'anklet', label: 'Anklets', icon: 'anklet', category: 'silver', subTypes: ['Chain', 'Charm', 'Beaded', 'Payal', 'Ghungroo', 'Layered'] },
-  { id: 'nosepin', label: 'Nose Pins', icon: 'nosepin', category: 'gold', subTypes: ['Stud', 'Hoop', 'Septum', 'Nath', 'Phul', 'Latkan', 'Diamond', 'Pearl'] },
-  { id: 'maangtikka', label: 'Maang Tikka', icon: 'maangtikka', category: 'gold', subTypes: ['Traditional', 'Contemporary', 'Matha Patti', 'Borla', 'Rakhdi', 'Jhoomar'] },
-  { id: 'earcuff', label: 'Ear Cuffs', icon: 'earcuff', category: 'gold', subTypes: ['Simple', 'Chain', 'Gemstone', 'Climber', 'Wrap', 'Double'] },
-  { id: 'brooch', label: 'Brooches', icon: 'brooch', category: 'platinum', subTypes: ['Floral', 'Animal', 'Geometric', 'Cameo', 'Enamel', 'Jeweled', 'Vintage'] },
-  { id: 'cufflink', label: 'Cufflinks', icon: 'cufflink', category: 'platinum', subTypes: ['Classic', 'Chain', 'Gemstone', 'Engraved', 'Novelty', 'Silk Knot'] },
-  { id: 'tiepin', label: 'Tie Pins', icon: 'tiepin', category: 'platinum', subTypes: ['Classic', 'Gemstone', 'Pearl', 'Monogram', 'Themed'] },
-  { id: 'watch', label: 'Watches', icon: 'watch', category: 'platinum', subTypes: ['Dress', 'Sports', 'Chronograph', 'Skeleton', 'Tourbillon', 'Smart'] },
-  { id: 'coin', label: 'Gold Coins', icon: 'coin', category: 'gold', subTypes: ['1g', '2g', '5g', '8g', '10g', '20g', '50g', '100g'] },
-  { id: 'bar', label: 'Gold Bars', icon: 'bar', category: 'gold', subTypes: ['5g', '10g', '20g', '50g', '100g', '250g', '500g', '1kg'] },
-  { id: 'loose-diamond', label: 'Loose Diamonds', icon: 'diamond', category: 'diamond', subTypes: ['Round', 'Princess', 'Oval', 'Cushion', 'Emerald', 'Pear', 'Marquise', 'Heart'] },
-  { id: 'loose-gemstone', label: 'Loose Gemstones', icon: 'gemstone', category: 'gemstone', subTypes: ['Ruby', 'Sapphire', 'Emerald', 'Tanzanite', 'Tourmaline', 'Spinel', 'Topaz', 'Garnet'] },
-  { id: 'pearl', label: 'Pearls', icon: 'pearl', category: 'gemstone', subTypes: ['Akoya', 'South Sea', 'Tahitian', 'Freshwater', 'Keshi', 'Mabe', 'Baroque'] },
-];
-
-const ITEM_CATEGORIES = JEWELRY_CATEGORIES.map(c => c.id);
-const PURITY_OPTIONS = ['24K','22K','21K','20K','18K','14K','12K','9K','999','925','950','PT950','PT900','PT850'];
-const METAL_TYPES = ['Gold','Silver','Platinum','Rose Gold','White Gold','Two-Tone','Tri-Color'];
-const STONE_TYPES = ['Diamond','Ruby','Sapphire','Emerald','Cubic Zirconia','Coral','Pearl','Navaratna','Spinel','Tourmaline','Topaz','Garnet','Opal','Tanzanite','Aquamarine','Morganite','Peridot','Amethyst','Citrine','Moonstone','Labradorite'];
-const STATUS_OPTIONS = ['stock','reserved','in_production','sold','returned','damaged'];
-const LOCATIONS = ['Showcase','Vault','Karigar','Workshop','Safe','Transit','Customer','Exhibition','Repair'];
-const MOVEMENT_TYPES = ['IN','OUT','ADJUSTMENT'];
-const MOVEMENT_REASONS = {IN:['Purchase','Production','Return from Karigar','Exchange In','Repair Return','Stock Found','Exhibition Return'],OUT:['Sale','Issue to Karigar','Exchange Out','Repair Send','Stock Transfer','Gift/Sample','Exhibition Send'],ADJUSTMENT:['Physical Count','Damage','Loss','Wastage','Revaluation','Stone Replacement','Resizing']};
-const PAYMENT_METHODS = ['Cash','Bank Transfer','Card','Wallet','UPI','Credit','Cheque','Gold Exchange','Installment'];
-
-const METAL_TXN_TYPES = [
-  {value:'OPENING_BALANCE',label:'Opening Balance',icon:'📊',color:'var(--info)'},
-  {value:'PURCHASE',label:'Purchase',icon:'📥',color:'var(--success)'},
-  {value:'ISSUE',label:'Issue to Production',icon:'📤',color:'var(--warning)'},
-  {value:'RETURN',label:'Return from Production',icon:'🔄',color:'var(--info)'},
-  {value:'RECEIPT',label:'Old Gold Receipt',icon:'♻️',color:'var(--gold-primary)'},
-  {value:'WASTAGE',label:'Wastage/Loss',icon:'🗑️',color:'var(--error)'},
-  {value:'ADJUSTMENT',label:'Adjustment',icon:'⚖️',color:'var(--text-muted)'}
-];
-const GOLD_PURITIES = ['24K','22K','21K','20K','18K','14K','12K','9K'];
-const SILVER_PURITIES = ['999','950','925','900','800'];
-const PLATINUM_PURITIES = ['PT950','PT900','PT850'];
-const METAL_UNITS = ['gram','tola','kg','pennyweight','ounce'];
-
-const JOB_STATUSES = ['Pending','In Progress','QC','Rework','Completed'];
-const JOB_STAGES = [
-  {id:'received',label:'Material Received',order:1,icon:'📥'},
-  {id:'casting',label:'Casting',order:2,icon:'🔥'},
-  {id:'filing',label:'Filing/Finishing',order:3,icon:'🔧'},
-  {id:'stone_setting',label:'Stone Setting',order:4,icon:'💎'},
-  {id:'polishing',label:'Polishing',order:5,icon:'✨'},
-  {id:'qc',label:'Quality Check',order:6,icon:'🔍'},
-  {id:'packing',label:'Packing',order:7,icon:'📦'},
-  {id:'delivered',label:'Delivered',order:8,icon:'🚚'}
-];
-const LABOUR_METHODS = ['perGram','perTola','flat','pctMetal'];
-const KARIGAR_SPECIALTIES = ['Casting','Filing','Stone Setting','Polishing','Engraving','Enameling','Chain Making','Wire Drawing','Filigree','Kundan','Meenakari','Thewa','Jadau','Other'];
-const QC_RESULTS = ['Pass','Fail','Conditional Pass'];
-const PRIORITY_OPTIONS = ['low','normal','high','urgent'];
-
-const JEWELRY_ICONS = {
-  ring: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="3"/></svg>`,
-  necklace: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2c-3.5 0-6.5 2-7.5 5 1.5 4.5 5.5 7 7.5 7s6-2.5 7.5-7c-1-3-4-5-7.5-5z"/><circle cx="12" cy="14" r="2"/></svg>`,
-  earring: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 4a6 6 0 0 0-6 6c0 3.5 3.5 5 6 9s6-5.5 6-9a6 6 0 0 0-6-6z"/><circle cx="12" cy="10" r="2"/></svg>`,
-  bracelet: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="12" cy="12" rx="7" ry="5"/><ellipse cx="12" cy="12" rx="4" ry="2"/></svg>`,
-  pendant: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 4l4 12h-8l4-12z"/><circle cx="12" cy="6" r="1.5"/></svg>`,
-  bangle: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="12" cy="12" rx="8" ry="6"/><ellipse cx="12" cy="12" rx="5" ry="3.5"/></svg>`,
-  anklet: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="12" cy="16" rx="6" ry="3"/><path d="M6 16c0-2 2-3 6-3s6 1 6 3"/></svg>`,
-  nosepin: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="2"/><path d="M12 14v4M10 16h4"/></svg>`,
-  maangtikka: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 4v6M8 7h8"/><circle cx="12" cy="14" r="4"/><circle cx="12" cy="14" r="1.5"/></svg>`,
-  earcuff: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M18 12a6 6 0 0 1-12 0"/><circle cx="12" cy="12" r="2"/></svg>`,
-  brooch: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="12" cy="12" rx="7" ry="5"/><path d="M12 7v10M7 12h10"/></svg>`,
-  cufflink: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="7" width="14" height="10" rx="2"/><line x1="12" y1="10" x2="12" y2="15"/></svg>`,
-  tiepin: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="12" y1="4" x2="12" y2="20"/><circle cx="12" cy="8" r="3"/></svg>`,
-  watch: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="8"/><path d="M12 6v6l4 2"/></svg>`,
-  coin: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/></svg>`,
-  bar: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="8" width="16" height="8" rx="1"/><line x1="12" y1="8" x2="12" y2="16"/></svg>`,
-  diamond: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2l7 7-7 7-7-7 7-7z"/></svg>`,
-  gemstone: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 3l8 5v8l-8 5-8-5V8l8-5z"/><path d="M12 3v18M4 8l8 5 8-5"/></svg>`,
-  pearl: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="7"/><circle cx="10" cy="10" r="1.5"/></svg>`,
-};
-
-// Calculations
-const calcItem={
-  fineWeight:(i)=>rnd(num(i.netWeight??i.weight)*num(i.purity)/24),
-  metalRate:(i)=>(i.metalType||i.metal)==='Silver'?num(state.rates.silver):num(state.rates.gold),
-  metalCost:(i)=>rnd(calcItem.fineWeight(i)*calcItem.metalRate(i)),
-  wastageCost:(i)=>rnd(calcItem.metalCost(i)*num(i.wastagePercent)/100),
-  makingCost:(i)=>num(i.makingCharge??i.making),
-  stoneCost:(i)=>{let c=0;(i.stoneDetails||[]).forEach(st=>{c+=num(st.weight)*num(st.rate)+num(st.setting);});return rnd(c||num(i.stones));},
-  totalCost:(i)=>rnd(calcItem.metalCost(i)+calcItem.wastageCost(i)+calcItem.makingCost(i)+calcItem.stoneCost(i)),
-  margin:(i)=>i.sellingPrice>0?rnd((i.sellingPrice-calcItem.totalCost(i))/i.sellingPrice*100):0,
-  marginAmount:(i)=>rnd(num(i.sellingPrice)-calcItem.totalCost(i))
+// Calculations — delegated to the trusted financial module (src/financial.js)
+// All currency arithmetic uses integer minor units; no float arithmetic for ledger amounts.
+const calcItem = {
+  fineWeight: (i) => {
+    const r = calcItemCost({
+      netWeight: i.netWeight ?? i.weight,
+      purity: i.purity,
+      metalRate: 0,
+      wastagePercent: 0,
+      makingCharge: 0
+    });
+    return r.ok ? r.result.fineWeight : rnd(num(i.netWeight ?? i.weight) * num(i.purity) / 24);
+  },
+  metalRate: (i) => (i.metalType || i.metal) === 'Silver' ? num(state.rates.silver) : num(state.rates.gold),
+  metalCost: (i) => {
+    const r = calcItemCost({
+      netWeight: i.netWeight ?? i.weight,
+      purity: i.purity,
+      metalRate: calcItem.metalRate(i),
+      wastagePercent: 0,
+      makingCharge: 0
+    });
+    return r.ok ? fromMinorUnits(r.result.metalValueMinor) : rnd(calcItem.fineWeight(i) * calcItem.metalRate(i));
+  },
+  wastageCost: (i) => {
+    const r = calcItemCost({
+      netWeight: i.netWeight ?? i.weight,
+      purity: i.purity,
+      metalRate: calcItem.metalRate(i),
+      wastagePercent: i.wastagePercent || 0,
+      makingCharge: 0
+    });
+    return r.ok ? fromMinorUnits(r.result.wastageCostMinor) : rnd(calcItem.metalCost(i) * num(i.wastagePercent) / 100);
+  },
+  makingCost: (i) => num(i.makingCharge ?? i.making),
+  stoneCost: (i) => {
+    const r = calcItemCost({
+      netWeight: i.netWeight ?? i.weight,
+      purity: i.purity,
+      metalRate: calcItem.metalRate(i),
+      wastagePercent: i.wastagePercent || 0,
+      makingCharge: i.makingCharge ?? i.making,
+      stoneDetails: i.stoneDetails || []
+    });
+    return r.ok ? fromMinorUnits(r.result.stoneCostMinor) : (() => { let c = 0; (i.stoneDetails || []).forEach(st => { c += num(st.weight) * num(st.rate) + num(st.setting); }); return rnd(c || num(i.stones)); })();
+  },
+  totalCost: (i) => {
+    const r = calcItemCost({
+      netWeight: i.netWeight ?? i.weight,
+      purity: i.purity,
+      metalRate: calcItem.metalRate(i),
+      wastagePercent: i.wastagePercent || 0,
+      makingCharge: i.makingCharge ?? i.making,
+      stoneDetails: i.stoneDetails || []
+    });
+    return r.ok ? fromMinorUnits(r.result.totalCostMinor) : rnd(calcItem.metalCost(i) + calcItem.wastageCost(i) + calcItem.makingCost(i) + calcItem.stoneCost(i));
+  },
+  margin: (i) => i.sellingPrice > 0 ? rnd((i.sellingPrice - calcItem.totalCost(i)) / i.sellingPrice * 100) : 0,
+  marginAmount: (i) => rnd(num(i.sellingPrice) - calcItem.totalCost(i))
 };
 function calcTax(amount){
-  const rate=num(state.settings.taxRate)/100;
-  if(!rate) return 0;
-  // Inclusive pricing: the amount already contains VAT, so tax is the contained portion.
-  return state.settings.taxInclusive ? rnd(amount-(amount/(1+rate))) : rnd(amount*rate);
+  const rate = num(state.settings.taxRate);
+  const inclusive = state.settings.taxInclusive !== false;
+  const r = trustedCalcCartTotals([{ basePrice: amount, qty: 1, discount: 0 }], rate, inclusive);
+  return r.ok ? r.result.taxNpr : (state.settings.taxInclusive ? rnd(amount - (amount / (1 + num(state.settings.taxRate) / 100))) : rnd(amount * num(state.settings.taxRate) / 100));
 }
 // ---- Daily metal rate sync (pluggable JSON source; no fabricated prices) ----
 const RATE_SYNC_DEFAULT={enabled:false,url:'',goldPath:'gold',silverPath:'silver',unit:'tola',lastSync:null,lastAttempt:null,lastStatus:'',lastMessage:''};
@@ -194,7 +230,7 @@ async function syncDailyRates({auto=false}={}){
   const notify=(m,t)=>window.RatnaOS?.showNotification?.(m,t);
   if(!cfg.url){
     state.settings.rateSync={...cfg,lastStatus:'error',lastMessage:'Rate source URL not configured'};
-    try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}
+    persistState();
     if(!auto) notify(t('Rate source URL not configured'),'warning');
     render(); return {ok:false,error:'no-url'};
   }
@@ -217,7 +253,7 @@ async function syncDailyRates({auto=false}={}){
   }catch(err){
     const msg=String(err&&err.message||err);
     state.settings.rateSync={...rateSyncSettings(),lastStatus:'error',lastMessage:msg};
-    try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}
+    persistState();
     if(!auto){ notify(t('Rate sync failed')+': '+msg,'error'); render(); }
     return {ok:false,error:msg};
   }
@@ -229,19 +265,32 @@ function maybeAutoSyncRates(){
   if(cfg.lastSync&&String(cfg.lastSync).slice(0,10)===today) return;
   if(cfg.lastAttempt&&String(cfg.lastAttempt).slice(0,10)===today) return;
   state.settings.rateSync={...cfg,lastAttempt:new Date().toISOString()};
-  try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}
+  persistState();
   syncDailyRates({auto:true});
 }
 
-function calcGross(taxable,tax){return state.settings.taxInclusive?rnd(taxable):rnd(taxable+tax);}
-function calcDiscount(amount,pct){return rnd(amount*pct/100);}
+function calcGross(taxable,tax){return state.settings.taxInclusive?roundCurrency2(taxable):roundCurrency2(taxable+tax);}
+function calcDiscount(amount,pct){return roundCurrency2(amount*pct/100);}
 function calcCartItem(item,qty=1){
   const basePrice=num(item.sellingPrice)||calcItem.totalCost(item);
-  const subtotal=rnd(basePrice*qty); const discount=0; const taxable=rnd(subtotal-discount);
-  const tax=calcTax(taxable); const total=calcGross(taxable,tax);
-  return {item,itemId:item.id,qty,basePrice,subtotal,discount,taxable,tax,total};
+  const r = calcCartTotals([{ basePrice, qty: Number(qty)||1, discount: 0 }], num(state.settings.taxRate), state.settings.taxInclusive !== false);
+  const itemTotal = r.ok ? r.result.totalNpr : roundCurrency2(basePrice*qty);
+  const tax = r.ok ? r.result.taxNpr : 0;
+  const taxable = r.ok ? r.result.taxableNpr : itemTotal;
+  return {item,itemId:item.id,qty:Number(qty)||1,basePrice,subtotal:itemTotal,discount:0,taxable,tax,total:itemTotal};
 }
 function calcCartTotals(cart){
+  const r = trustedCalcCartTotals(cart, num(state.settings.taxRate), state.settings.taxInclusive !== false);
+  if (r.ok) {
+    return {
+      subtotal: r.result.subtotalNpr,
+      discount: r.result.discountNpr,
+      taxable: r.result.taxableNpr,
+      tax: r.result.taxNpr,
+      total: r.result.totalNpr
+    };
+  }
+  // Fallback to legacy float calculation
   const subtotal=rnd(cart.reduce((s,x)=>s+x.subtotal,0));
   const discount=rnd(cart.reduce((s,x)=>s+x.discount,0));
   const taxable=rnd(subtotal-discount);
@@ -266,16 +315,41 @@ function getAllMetalBalances(){
   ['Gold','Silver'].forEach(m=>purities[m].forEach(p=>{const bal=calcMetalBalance(m,p); if(bal!==0||getOpeningBalance(m,p)!==0){balances[getMetalKey(m,p)]={metal:m,purity:p,balance:bal,opening:getOpeningBalance(m,p)};}}));
   return balances;
 }
+
+// Export core functions for page modules
+export { stock, totals, calcItem, getAllMetalBalances, getKarigar, getKarigarJobs, isJobActiveStatus, ensureJobShape, getJobIssuedWeight, getJobReturnedWeight, getJobNetIssued, recalcJobFinancials, updateKarigarStats, syncJobKarigar, generateSKU, generateBarcode, generateQRData, recordMovement, generateInvoiceNumber, getCustomer, updateCustomerStats, fine, rateFor, price, UNITS, toGram, fromGram, convert, download, data, validatePositive, INCOME_CATEGORIES, TAX_TYPES, canEditTransaction, postPeriod, isPeriodPosted, generateMetalTxnNumber, calcCartTotals, calcMetalBalance, getMetalKey, getSupplier, getExpense, generateExpenseNumber, generateSupplierCode, updateSupplierStats };
 function canEditTransaction(txn){if(!txn.posted) return true; const period=txn.date?.slice(0,7); return !state.metalManagement.postedPeriods.includes(period);}
 function postPeriod(period){if(!state.metalManagement.postedPeriods.includes(period)){state.metalManagement.postedPeriods.push(period);state.metalManagement.postedPeriods.sort();}}
 function isPeriodPosted(period){return state.metalManagement.postedPeriods.includes(period);}
 function generateMetalTxnNumber(type){const prefix=(type||'TXN').slice(0,3).toUpperCase();const date=new Date();const seq=(state.metalManagement.transactions.filter(t=>t.type===type&&t.date&&t.date.startsWith(date.toISOString().slice(0,10))).length+1).toString().padStart(4,'0');return `${prefix}-${date.toISOString().slice(0,10).replace(/-/g,'')}-${seq}`;}
-function recordMetalTxn(data){
-  const txn={id:id(),type:data.type,metal:data.metal,purity:data.purity,unit:data.unit||'gram',weight:num(data.weight),rate:num(data.rate||0),value:num(data.value||0),adjustment:num(data.adjustment||0),reference:data.reference||'',notes:data.notes||'',karigar:data.karigar||'',jobCode:data.jobCode||'',customer:data.customer||'',date:data.date||new Date().toISOString().slice(0,10),posted:data.posted!==false,postedAt:new Date().toISOString(),createdAt:new Date().toISOString(),schemaVersion:1};
-  state.metalManagement.transactions.unshift(txn);
-  if (txn.posted !== false) postMetalTxn(state, txn);
-  save('Metal transaction recorded',`${txn.type} ${txn.metal} ${txn.purity} ${num(txn.weight).toFixed(3)}g`);
-  return txn;
+async function recordMetalTxn(data){
+  const reference = data.reference || generateMetalTxnNumber(data.type||'TXN');
+  const idempotencyKey = `metal_txn:${reference}:${data.type}:${data.metal}:${data.purity}:${data.date||new Date().toISOString().slice(0,10)}`;
+
+  if (window.RatnaOS?.idempotencyHas?.(idempotencyKey)) {
+    return { success: true, _idempotent: true, txn: null };
+  }
+
+  const result = await window.RatnaOS.atomicOperation(idempotencyKey, async () => {
+    const txn = {
+      id: id(), type: data.type, metal: data.metal, purity: data.purity,
+      unit: data.unit || 'gram', weight: num(data.weight), rate: num(data.rate || 0),
+      value: num(data.value || 0), adjustment: num(data.adjustment || 0), reference,
+      notes: data.notes || '', karigar: data.karigar || '', jobCode: data.jobCode || '',
+      customer: data.customer || '', date: data.date || new Date().toISOString().slice(0, 10),
+      posted: data.posted !== false, postedAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(), schemaVersion: 1
+    };
+    state.metalManagement.transactions.unshift(txn);
+    if (txn.posted !== false) postMetalTxn(state, txn);
+    save('Metal transaction recorded', `${txn.type} ${txn.metal} ${txn.purity} ${num(txn.weight).toFixed(3)}g`);
+    return { success: true, txn };
+  });
+
+  if (result && result.success) {
+    return result.txn || result;
+  }
+  throw new Error(result && result.error ? result.error : 'Metal transaction failed');
 }
 // Supplier helpers
 function getSupplier(id){return state.suppliers.find(s=>s.id===id);}
@@ -285,8 +359,6 @@ function recordSupplierPayment(supplierId,amount,method,reference,notes){const s
 
 // Expense helpers
 function getExpense(id){return state.expenses.find(e=>e.id===id);}
-const EXPENSE_CATEGORIES=['Rent','Utilities','Salaries','Marketing','Transport','Insurance','Maintenance','Professional Fees','Office Supplies','Taxes','Licenses','Bank Charges','Other'];
-const EXPENSE_STATUSES=['paid','pending','overdue','cancelled'];
 function generateExpenseNumber(){const date=new Date();const seq=(state.expenses.filter(e=>(e.date||e.createdAt||'').startsWith(date.toISOString().slice(0,10))).length+1).toString().padStart(4,'0');return `EXP-${date.toISOString().slice(0,10).replace(/-/g,'')}-${seq}`;}
 function getExpenseTotals(startDate,endDate){let list=state.expenses; if(startDate) list=list.filter(e=>new Date(e.date)>=new Date(startDate)); if(endDate) list=list.filter(e=>new Date(e.date)<=new Date(endDate)); const byCat={}; let total=0; list.forEach(e=>{if(e.status!=='cancelled'){total+=num(e.amount); byCat[e.category]=(byCat[e.category]||0)+num(e.amount);}}); return {total,byCat,count:list.length};}
 
@@ -440,93 +512,12 @@ function getAllowedTabs() {
   return Object.keys(tabPermissions).filter(tab => tabPermissions[tab]());
 }
 
-const NAV_ICONS={
-  dashboard:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>`,
-  inventory:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>`,
-  pos:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>`,
-  metals:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>`,
-  exchange:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 16l-4-4 4-4"/><path d="M17 8l4 4-4 4"/><path d="M3 12h18"/></svg>`,
-  karigar:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`,
-  production:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>`,
-  reports:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>`,
-  knowledge:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v16H6.5A2.5 2.5 0 0 0 4 21.5z"/><path d="M4 5.5v16"/><path d="M9 8h7"/><path d="M9 12h5"/></svg>`,
-  accounting:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 3h16v18H4z"/><path d="M8 7h8"/><path d="M8 11h8"/><path d="M8 15h4"/><path d="M16 15h.01"/></svg>`,
-  tax:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3h12l3 18H3z"/><path d="M9 8h6"/><path d="M9 12h6"/><path d="M9 16h3"/></svg>`,
-  suppliers:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-4-4H17a4 4 0 0 0-4 4v2"/><circle cx="21" cy="7" r="4"/></svg>`,
-  expenses:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M12 6v6l4 2"/></svg>`,
-  settings:`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.6V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09c-.658.003-1.25.396-1.51 1z"/></svg>`
-};
-
-// Apple-style (SF Symbols inspired) icon set — 24×24, 1.75 stroke, rounded caps
-const ICON_PATHS = {
-  menu: '<line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/>',
-  close: '<line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/>',
-  plus: '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
-  minus: '<line x1="5" y1="12" x2="19" y2="12"/>',
-  search: '<circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/>',
-  bell: '<path d="M18 8a6 6 0 1 0-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 20a2 2 0 0 1-3.4 0"/>',
-  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/>',
-  users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20v-1a5.5 5.5 0 0 1 5.5-5.5h2A5.5 5.5 0 0 1 15.5 19v1"/><path d="M16.5 5.2a3.5 3.5 0 0 1 0 6.6"/><path d="M18.5 20v-1a5.4 5.4 0 0 0-2.2-4.4"/>',
-  logout: '<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3"/><path d="M10 16l-4-4 4-4"/><line x1="6" y1="12" x2="16" y2="12"/>',
-  edit: '<path d="M4 20h4l10-10a2.8 2.8 0 0 0-4-4L4 16v4z"/><line x1="13.5" y1="6.5" x2="17.5" y2="10.5"/>',
-  trash: '<path d="M4 7h16"/><path d="M9 7V4.8A.8.8 0 0 1 9.8 4h4.4a.8.8 0 0 1 .8.8V7"/><path d="M6.5 7l.8 12.2a1.8 1.8 0 0 0 1.8 1.8h5.8a1.8 1.8 0 0 0 1.8-1.8L17.5 7"/><line x1="10.5" y1="11" x2="10.5" y2="17"/><line x1="13.5" y1="11" x2="13.5" y2="17"/>',
-  save: '<path d="M5 3h11l3 3v15H5z"/><path d="M8 3v6h7V3"/><path d="M8 21v-7h8v7"/>',
-  print: '<path d="M7 9V3h10v6"/><rect x="4" y="9" width="16" height="7" rx="2"/><path d="M7 14h10v7H7z"/>',
-  download: '<path d="M12 3v12"/><path d="M7 11l5 5 5-5"/><path d="M4 19h16"/>',
-  upload: '<path d="M12 16V4"/><path d="M7 8l5-5 5 5"/><path d="M4 19h16"/>',
-  check: '<path d="M4.5 12.5l5 5 10-11"/>',
-  checkCircle: '<circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.6 2.6L16 9.5"/>',
-  alert: '<path d="M12 3.8l9 16.2H3z"/><line x1="12" y1="9.5" x2="12" y2="14"/><circle cx="12" cy="17" r="0.9" fill="currentColor" stroke="none"/>',
-  info: '<circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><circle cx="12" cy="7.8" r="0.9" fill="currentColor" stroke="none"/>',
-  sparkle: '<path d="M12 3l1.9 5.6L19.5 10l-5.6 1.9L12 17.5l-1.9-5.6L4.5 10l5.6-1.4L12 3z"/><path d="M18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2z"/>',
-  crown: '<path d="M3 8l4 3 5-7 5 7 4-3-2 12H5z"/><path d="M5 20h14"/>',
-  gem: '<path d="M7 3h10l4 6-9 12L3 9z"/><path d="M3 9h18"/><path d="M12 21L8 9l4-6 4 6-4 12z"/>',
-  diamond: '<path d="M12 2.5l8.5 8.5-8.5 10-8.5-10z"/><path d="M3.5 11h17"/>',
-  cart: '<circle cx="9.5" cy="19.5" r="1.6"/><circle cx="17.5" cy="19.5" r="1.6"/><path d="M3 4h2.5l2.3 10.5h10.4L21 7H6"/>',
-  wallet: '<path d="M3 8.5A2.5 2.5 0 0 1 5.5 6H19a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5.5A2.5 2.5 0 0 1 3 17.5z"/><path d="M3 9h18"/><circle cx="16.5" cy="14" r="1.2"/>',
-  chart: '<path d="M4 20V9"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20V7"/>',
-  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3.4 2.2"/>',
-  calendar: '<rect x="3.5" y="5" width="17" height="16" rx="2.5"/><line x1="3.5" y1="10" x2="20.5" y2="10"/><line x1="8" y1="3" x2="8" y2="7"/><line x1="16" y1="3" x2="16" y2="7"/>',
-  chevronRight: '<path d="M9 5l7 7-7 7"/>',
-  chevronDown: '<path d="M5 9l7 7 7-7"/>',
-  arrowUp: '<path d="M12 20V5"/><path d="M6 11l6-6 6 6"/>',
-  arrowDown: '<path d="M12 4v15"/><path d="M18 13l-6 6-6-6"/>',
-  filter: '<path d="M3 5h18l-7 8v6l-4 2v-8z"/>',
-  refresh: '<path d="M20 11a8 8 0 1 0-2.3 6.3"/><path d="M20 5v6h-6"/>',
-  lock: '<rect x="4.5" y="10" width="15" height="11" rx="2.5"/><path d="M8 10V7.5a4 4 0 0 1 8 0V10"/>',
-  mail: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M3.5 7l8.5 6 8.5-6"/>',
-  phone: '<path d="M6.5 3.5l3 3-2 2.5a12 12 0 0 0 5.5 5.5l2.5-2 3 3-1.5 2.5a2 2 0 0 1-2.3.9C9.6 17.4 6.1 13.9 4.1 7.3A2 2 0 0 1 5 5z"/>',
-  mapPin: '<path d="M12 21s7-6.1 7-11a7 7 0 1 0-14 0c0 4.9 7 11 7 11z"/><circle cx="12" cy="10" r="2.6"/>',
-  camera: '<path d="M4 8h3l1.5-2h7L17 8h3a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 20 20H4a1.5 1.5 0 0 1-1.5-1.5v-9A1.5 1.5 0 0 1 4 8z"/><circle cx="12" cy="13.5" r="3.4"/>',
-  star: '<path d="M12 3.5l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17.5l-5.4 2.9 1-6.1L3.2 10l6.1-.9z"/>',
-  heart: '<path d="M12 20.5S3.5 15.2 3.5 9.2A4.7 4.7 0 0 1 12 6.3a4.7 4.7 0 0 1 8.5 2.9c0 6-8.5 11.3-8.5 11.3z"/>',
-  scale: '<path d="M12 3v18"/><path d="M5 21h14"/><path d="M7 7h10"/><path d="M7 7l-3.5 7h7z"/><path d="M17 7l-3.5 7h7z"/>',
-  scissors: '<circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><path d="M8 7.5L20 19"/><path d="M8 16.5L20 5"/>',
-  gift: '<rect x="3.5" y="9" width="17" height="12" rx="2"/><path d="M3.5 13h17"/><path d="M12 9v12"/><path d="M12 9C10 9 7 8.2 7 6a2.5 2.5 0 0 1 5 0c0 2 0 3 0 3z"/><path d="M12 9c2 0 5-.8 5-3a2.5 2.5 0 0 0-5 0c0 2 0 3 0 3z"/>',
-  flame: '<path d="M12 21c4 0 6.5-2.6 6.5-6 0-4.5-4.5-6.5-4.5-11 0 0-2 2.5-2 5.5 0 1.8-1 2.5-1.8 1.7C9.4 10.3 9 8 9 8c-1.5 2-3.5 4.2-3.5 7 0 3.4 2.5 6 6.5 6z"/>'
-};
 function icon(name, cls = ''){
   const p = ICON_PATHS[name];
   if(!p) return '';
   return `<svg class="icon ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${p}</svg>`;
 }
 
-const _PAGE_TITLES={
-  dashboard:['Dashboard','Overview'],
-  inventory:['Inventory','Stock register'],
-  pos:['Point of Sale','Billing counter'],
-  metals:['Metal Management','Balances & issue'],
-  exchange:['Old Gold Exchange','Assessment register'],
-  karigar:['Karigar & Jobs','Jobs & karigars'],
-  production:['Production Stages','Job pipeline'],
-  reports:['Reports & Analytics','Financial reports'],
-  accounting:['Accounting','Ledger, journals and trial balance'],
-  tax:['Tax & Compliance','VAT, TDS registers and returns'],
-  knowledge:['Knowledge Center','Catalogue & reference'],
-  suppliers:['Suppliers','Vendors & payables'],
-  expenses:['Expenses','Business expenses'],
-  settings:['Settings','Workspace setup']
-};
 const PAGE_TITLES=new Proxy(_PAGE_TITLES,{get(o,k){const v=o[k];return Array.isArray(v)?v.map(x=>t(x)):(typeof v==='string'?t(v):v);}});
 
 
@@ -534,7 +525,11 @@ const input=(name,label,type='text',value='',extra='')=>`<div class="field"><lab
 const select=(name,label,opts,val='',extra='')=>`<div class="field" ${extra.includes('data-field-wrap')?'': ''}><label class="field-label" for="${name}">${t(label)}</label><select class="field-select" id="${name}" name="${name}" ${extra}>${opts.map(x=>{const v=(typeof x==='object')?x.value:x; const l=(typeof x==='object')?x.label:x; return `<option value="${esc(v)}" ${String(v)===String(val)?'selected':''}>${esc(l)}</option>`}).join('')}</select></div>`;
 const textarea=(name,label,val='',extra='')=>`<div class="field"><label class="field-label" for="${name}">${t(label)}</label><textarea class="field-textarea" id="${name}" name="${name}" ${extra}>${esc(val)}</textarea></div>`;
 const card=(label,value,sub='',iconName='',tab='')=>`<div class="metric-card${tab?' metric-link':''}"${tab?` data-tab="${tab}" role="button" tabindex="0"`:''}>${iconName?`<span class="metric-icon">${icon(iconName)}</span>`:''}<div class="metric-label">${t(label)}</div><div class="metric-value">${translateDigits(value)}</div>${sub?`<div class="metric-sub">${sub}</div>`:''}</div>`;
-const rows=(headers,body)=>`<div class="table-wrap"><table class="table"><thead><tr>${headers.map(h=>`<th>${t(h)}</th>`).join('')}</tr></thead><tbody>${body||`<tr><td colspan="${headers.length}" class="align-center"><div class="empty"><p class="empty-title">No records yet</p></div></td></tr>`}</tbody></table></div>`;
+const rows=(headers,body)=>`<div class="table-wrap"><table class="table"><thead><tr>${headers.map(h=>`<th>${t(h)}</th>`).join('')}</tr></thead><tbody>${body||`<tr><td colspan="${headers.length}" class="align-center"><div class="empty"><p class="empty-title">${t('No records yet')}</p></div></td></tr>`}</tbody></table></div>`;
+
+// Export UI helpers for page modules
+export { input, select, textarea, card, rows, icon, jobStatusBadge, kcBadge, kcName, kcLang, kcCanEdit, kcEditBtns, kcAdminBar, kcStatus };
+
 
 
 function dashboard(){
@@ -545,14 +540,76 @@ function dashboard(){
   const silverBal=Object.values(balances).filter(b=>b.metal==='Silver').reduce((s,b)=>s+b.balance,0);
   return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.dashboard[0]}</h1><p class="page-subtitle">${PAGE_TITLES.dashboard[1]}</p></div><div class="page-header-actions"><button class="btn btn-champagne" data-tab="inventory">${icon('plus')}<span>${t('Add Jewellery')}</span></button><button class="btn btn-secondary" data-tab="pos">${icon('cart')}<span>${t('New Sale')}</span></button></div></div></div>
-<div class="metric-grid">${card('Stock Value',money(sums.value),t('Indicative'),'sparkle','inventory')} ${card('Total Sales',money(sums.sales),t('Recorded'),'cart','reports')} ${card('Open Jobs',openJobs,t('In progress'),'clock','karigar')} ${card('Metal Ledger (Au/Ag)',`${rnd(goldBal).toFixed(3)}g / ${rnd(silverBal).toFixed(3)}g`,t('Current balances'),'scale','metals')}</div>
+<div class="metric-grid">${card(t('Stock Value'),money(sums.value),t('Indicative'),'sparkle','inventory')} ${card(t('Total Sales'),money(sums.sales),t('Recorded'),'cart','reports')} ${card(t('Open Jobs'),openJobs,t('In progress'),'clock','karigar')} ${card(t('Metal Ledger (Au/Ag)'),`${rnd(goldBal).toFixed(3)}g / ${rnd(silverBal).toFixed(3)}g`,t('Current balances'),'scale','metals')}</div>
 <div class="layout"><div>
-  <div class="card"><div class="card-header"><h2 class="card-title">Recent Transactions</h2><button class="btn btn-ghost btn-sm" data-tab="reports">View all</button></div><div class="card-body" style="padding:0">${rows(['Date','Invoice','Customer','Amount'],state.sales.slice(0,7).map(s=>`<tr><td>${fmtDate(s.date)}</td><td><code class="mono">${esc(s.invoice)}</code></td><td>${esc(s.customerName||s.customer||'-')}</td><td class="align-right mono">${money(s.total)}</td></tr>`).join(''))}</div></div>
-  <div class="card"><div class="card-header"><h2 class="card-title">Daily Metal Rates</h2></div><div class="card-body"><form id="rates" class="form" style="margin-top:0">${input('gold',`${t('Gold')} (${state.settings.currency} / ${t('fine g')})`,'number',state.rates.gold,'min="0" step="0.01"')}${input('silver',`${t('Silver')} (${state.settings.currency} / g)`,'number',state.rates.silver,'min="0" step="0.01"')}<div class="field-full" style="display:flex;gap:var(--space-2);flex-wrap:wrap"><button class="btn btn-champagne" type="submit" style="flex:1">${t('Update Rates')}</button><button class="btn btn-ghost btn-sm" type="button" data-rate-sync>${icon('refresh')}<span>${t('Sync now')}</span></button></div><p class="small muted" style="margin:var(--space-2) 0 0">${state.rates.updatedAt?`${t('Updated')}: ${fmtDateTime(state.rates.updatedAt)}`:`${t('Manual rates')}`}${state.settings.rateSync?.lastStatus==='error'?` · <span style="color:var(--error)">${esc(state.settings.rateSync.lastMessage||'')}</span>`:''}</p></form></div></div>
+<div class="card"><div class="card-header"><h2 class="card-title">${t('Recent Transactions')}</h2><button class="btn btn-ghost btn-sm" data-tab="reports">${t('View all')}</button></div><div class="card-body" style="padding:0">${rows([t('Date'),t('Invoice'),t('Customer'),t('Amount')],state.sales.slice(0,7).map(s=>`<tr><td>${fmtDate(s.date)}</td><td><code class="mono">${esc(s.invoice)}</code></td><td>${esc(s.customerName||s.customer||'-')}</td><td class="align-right mono">${money(s.total)}</td></tr>`).join(''))}</div></div>
+<div class="card"><div class="card-header"><h2 class="card-title">${t('Daily Metal Rates')}</h2></div><div class="card-body"><form id="rates" class="form" style="margin-top:0">${input('gold',`${t('Gold')} (${state.settings.currency} / ${t('fine g')})`,'number',state.rates.gold,'min="0" step="0.01"')}${input('silver',`${t('Silver')} (${state.settings.currency} / g)`,'number',state.rates.silver,'min="0" step="0.01"')}<div class="field-full" style="display:flex;gap:var(--space-2);flex-wrap:wrap"><button class="btn btn-champagne" type="submit" style="flex:1">${t('Update Rates')}</button><button class="btn btn-ghost btn-sm" type="button" data-rate-sync>${icon('refresh')}<span>${t('Sync now')}</span></button></div><p class="small muted" style="margin:var(--space-2) 0 0">${state.rates.updatedAt?`${t('Updated')}: ${fmtDateTime(state.rates.updatedAt)}`:`${t('Manual rates')}`}${state.settings.rateSync?.lastStatus==='error'?` · <span style="color:var(--error)">${esc(state.settings.rateSync.lastMessage||'')}</span>`:''}</p></form></div></div>
 </div><div>
-  <div class="card"><div class="card-header"><h2 class="card-title">Job Status</h2></div><div class="card-body"><div style="display:flex;flex-direction:column;gap:10px">${JOB_STATUSES.map(s=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:var(--bg-surface);border-radius:var(--radius-md);border:1px solid var(--border-subtle)"><span>${esc(t(s))}</span>${jobStatusBadge(s).replace(s, String(state.jobs.filter(j=>j.status===s).length)+'')}</div>`).join('')}</div></div></div>
-  <div class="card"><div class="card-header"><h2 class="card-title">Quick Actions</h2></div><div class="card-body" style="display:flex;flex-direction:column;gap:10px"><button class="btn btn-secondary" data-tab="karigar">Karigar & Jobs</button><button class="btn btn-secondary" data-tab="production">Production Stages</button><button class="btn btn-secondary" data-tab="metals">Metal Management</button><button class="btn btn-secondary" data-tab="exchange">Old Gold Exchange</button>${window.RatnaOS?.auth?.hasPermission?.('accounting:read')?`<button class="btn btn-secondary" data-tab="accounting">${t('Accounting')}</button>`:''}</div></div>
+  <div class="card"><div class="card-header"><h2 class="card-title">${t('Job Status')}</h2></div><div class="card-body"><div style="display:flex;flex-direction:column;gap:10px">${JOB_STATUSES.map(s=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:var(--bg-surface);border-radius:var(--radius-md);border:1px solid var(--border-subtle)"><span>${esc(t(s))}</span>${jobStatusBadge(s).replace(s, String(state.jobs.filter(j=>j.status===s).length)+'')}</div>`).join('')}</div></div></div>
+  <div class="card"><div class="card-header"><h2 class="card-title">${t('Quick Actions')}</h2></div><div class="card-body" style="display:flex;flex-direction:column;gap:10px"><button class="btn btn-secondary" data-tab="karigar">${t('Karigar & Jobs')}</button><button class="btn btn-secondary" data-tab="production">${t('Production Stages')}</button><button class="btn btn-secondary" data-tab="metals">${t('Metal Management')}</button><button class="btn btn-secondary" data-tab="exchange">${t('Old Gold Exchange')}</button>${window.RatnaOS?.auth?.hasPermission?.('accounting:read')?`<button class="btn btn-secondary" data-tab="accounting">${t('Accounting')}</button>`:''}</div></div>
 </div></div>`;
+}
+
+function renderInventoryList(list){
+  if(!list.length) return `<div class="empty"><svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6v6H9z"/></svg><p class="empty-title">${t('No items found')}</p><p class="empty-message">${t('Add your first jewellery item above')}</p></div>`;
+  return list.map(i=>{
+    const cat=JEWELRY_CATEGORIES.find(c=>c.id===i.category);
+    const catIcon=cat?JEWELRY_ICONS[cat.icon]:'';
+    const cost=calcItem.totalCost(i);
+    const margin=i.sellingPrice?((i.sellingPrice-cost)/i.sellingPrice*100):0;
+    const statusClass='badge-'+(i.status||'stock').toLowerCase().replace('_','-');
+    return `
+    <div class="inv-card" data-id="${esc(i.id)}">
+      <div class="inv-card-header">
+        <div class="inv-card-main">
+          <span class="category-badge ${i.category}">${catIcon}<span class="nav-label">${cat?t(cat.label):i.category}</span></span>
+          <h3 class="inv-card-name">${esc(i.name)}</h3>
+        </div>
+        <div class="inv-card-meta">
+          <code class="mono">${esc(i.sku)}</code>
+          <span class="purity-badge ${i.category}">${esc(i.purity)}</span>
+        </div>
+      </div>
+      <div class="inv-card-body">
+        <div class="inv-card-row">
+          <span class="inv-label">${t('Code')}:</span>
+          <span class="inv-value mono">${esc(i.code)}</span>
+        </div>
+        <div class="inv-card-row">
+          <span class="inv-label">${t('Metal')}:</span>
+          <span class="inv-value">${esc(lt(i.metalType||i.metal||''))}</span>
+        </div>
+        <div class="inv-card-row">
+          <span class="inv-label">${t('Net (g)')}:</span>
+          <span class="inv-value mono">${num(i.netWeight||i.weight).toFixed(3)}g</span>
+        </div>
+        <div class="inv-card-row">
+          <span class="inv-label">${t('Cost')}:</span>
+          <span class="inv-value">${money(cost)}</span>
+        </div>
+        <div class="inv-card-row">
+          <span class="inv-label">${t('Sell')}:</span>
+          <span class="inv-value">${money(i.sellingPrice)}</span>
+        </div>
+        <div class="inv-card-row">
+          <span class="inv-label">${t('Margin')}:</span>
+          <span class="inv-value ${margin<10?'':'margin-ok'}">${margin.toFixed(1)}%</span>
+        </div>
+        <div class="inv-card-row">
+          <span class="inv-label">${t('Status')}:</span>
+          <span class="badge ${statusClass}">${t(i.status||'stock')}</span>
+        </div>
+        <div class="inv-card-row">
+          <span class="inv-label">${t('Location')}:</span>
+          <span class="inv-value">${esc(lt(i.location||'Showcase'))}</span>
+        </div>
+      </div>
+      <div class="inv-card-actions">
+        <button class="btn btn-ghost btn-sm" data-inv-edit="${esc(i.id)}">${icon('edit')} ${t('Edit')}</button>
+        <button class="btn btn-danger btn-sm" data-inv-delete="${esc(i.id)}">${icon('trash-2')} ${t('Delete')}</button>
+      </div>
+    </div>`;
+  }).join('');
 }
 
 function inventory(){
@@ -573,21 +630,21 @@ function inventory(){
   const metals=[...new Set(state.items.map(i=>i.metalType||i.metal).filter(Boolean))];
   const purities=[...new Set(state.items.map(i=>String(i.purity)).filter(Boolean))].sort();
   return `
-<div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.inventory[0]}</h1><p class="page-subtitle">${PAGE_TITLES.inventory[1]}</p></div><div class="page-header-actions"><button class="btn btn-secondary" data-inv-export>Export CSV</button><button class="btn btn-champagne" data-inv-add>${icon('plus')} ${t('New Item')}</button></div></div></div>
-<div class="card"><div class="card-header"><h2 class="card-title">Add / Edit Jewellery Item</h2></div><div class="card-body"><form id="itemForm" class="form" data-edit-id="">
+<div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.inventory[0]}</h1><p class="page-subtitle">${PAGE_TITLES.inventory[1]}</p></div><div class="page-header-actions"><button class="btn btn-secondary" data-inv-export>${t('Export CSV')}</button><button class="btn btn-champagne" data-inv-add>${icon('plus')} ${t('New Item')}</button></div></div></div>
+<div class="card"><div class="card-header"><h2 class="card-title">${t('Add / Edit Jewellery Item')}</h2></div><div class="card-body"><form id="itemForm" class="form" data-edit-id="">
   <input type="hidden" name="id" id="itemId"><input type="hidden" name="category" id="itemCategory" value="gold">
-  <div class="tabs" id="itemTypeTabs" style="margin-bottom:12px"><button type="button" class="tab active" data-cat="gold">Gold</button><button type="button" class="tab" data-cat="silver">Silver</button><button type="button" class="tab" data-cat="diamond">Diamond</button><button type="button" class="tab" data-cat="gemstone">Gemstone</button></div>
+  <div class="tabs" id="itemTypeTabs" style="margin-bottom:12px"><button type="button" class="tab active" data-cat="gold">${t('Gold')}</button><button type="button" class="tab" data-cat="silver">${t('Silver')}</button><button type="button" class="tab" data-cat="diamond">${t('Diamond')}</button><button type="button" class="tab" data-cat="gemstone">${t('Gemstone')}</button></div>
   <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px">${input('code','Item Code','text','','')}${input('sku','SKU','text','','readonly')}</div>
-  <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px">${input('name','Item Name','text','','')}${select('metalType','Metal Type',METAL_TYPES,'Gold')}</div>
-  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">${select('purity','Purity',PURITY_OPTIONS,'22K')}${input('grossWeight','Gross (g)','number','','min="0" step="0.001"')}${input('stoneWeight','Stone (g)','number','0','min="0" step="0.001"')}${input('netWeight','Net (g)','number','','min="0" step="0.001" readonly')}</div>
+  <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px">${input('name','Item Name','text','','required')}${select('metalType','Metal Type',METAL_TYPES_BY_CATEGORY.gold.map(v=>({value:v,label:lt(v)})),'Gold')}</div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">${select('purity','Purity',PURITY_OPTIONS,'22K')}${input('grossWeight','Gross (g)','number','','min="0" step="0.001" required')}${input('stoneWeight','Stone (g)','number','0','min="0" step="0.001"')}${input('netWeight','Net (g)','number','','min="0" step="0.001" readonly')}</div>
   <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">${input('makingCharge','Making (NPR)','number','0','min="0" step="0.01"')}${input('wastagePercent','Wastage %','number','0','min="0" step="0.1"')}${input('wastageWeight','Wastage (g)','number','0','min="0" step="0.001" readonly')}${input('costPrice','Cost (NPR)','number','','min="0" step="0.01" readonly')}</div>
   <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px">${input('sellingPrice','Selling (NPR)','number','','min="0" step="0.01"')}${input('marginPercent','Margin %','number','','readonly')}${input('barcode','Barcode','text','','readonly')}${input('qrCode','QR Data','text','','readonly')}</div>
   <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px">${select('status','Status',STATUS_OPTIONS.map(v=>({value:v,label:t(v)})),'stock')}${select('location','Location',LOCATIONS.map(v=>({value:v,label:t(v)})),'Showcase')}${input('tags','Tags (comma)','text','','')}</div>
   <div id="stoneDetailsSection" style="display:none"><h4>${t('Stone Details')}</h4><div id="stoneDetailsRows"></div><button type="button" class="btn btn-secondary btn-sm" data-add-stone>${icon('plus')} ${t('Add Stone Row')}</button></div>
   <div><h4>Images</h4><input type="file" id="itemImages" accept="image/*" multiple style="display:none"><button type="button" class="btn btn-secondary btn-sm" data-add-images>Upload Images</button><div id="imagePreview" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px"></div></div>
-  <div class="field-full" style="display:flex;gap:8px"><button class="btn btn-gold" type="submit"><span id="submitBtnText">Add to Inventory</span></button><button type="button" class="btn btn-secondary" data-inv-cancel style="display:none">Cancel Edit</button></div>
+  <div class="field-full" style="display:flex;gap:8px"><button class="btn btn-champagne" type="submit"><span id="submitBtnText">Add to Inventory</span></button><button type="button" class="btn btn-secondary" data-inv-cancel style="display:none">Cancel Edit</button></div>
 </form></div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">${t('Inventory')}</h2></div><div class="card-body"><div class="toolbar" style="display:flex;gap:var(--space-3);flex-wrap:wrap;margin-bottom:var(--space-5)"><input type="search" id="invSearch" class="field-input" placeholder="Search items..." value="${esc(searchQuery)}" style="max-width:300px">${select('invFilterCategory','', ['all',...JEWELRY_CATEGORIES.map(c=>({value:c.id,label:c.label}))], filterCategory)}${select('invFilterStatus','', [{value:'all',label:t('All')},...STATUS_OPTIONS.map(v=>({value:v,label:t(v)}))], filterStatus)}${select('invFilterMetal','', [{value:'all',label:t('All')},...metals.map(v=>({value:v,label:lt(v)}))], filterMetal)}${select('invFilterPurity','', ['all',...purities], filterPurity)}${select('invSortBy','', [{value:'createdAt',label:t('Newest first')},{value:'name',label:t('Name')},{value:'sku',label:t('SKU')},{value:'netWeight',label:t('Net weight')},{value:'sellingPrice',label:t('Selling Price')},{value:'status',label:t('Status')}], sortBy)}<button class="btn btn-ghost btn-sm" data-inv-sort-dir="${sortDir}" title="${sortDir==='asc'?t('Ascending'):t('Descending')}">${sortDir==='asc'?'↑':'↓'}</button></div>${rows(['SKU','Code','Name','Category','Metal','Purity','Net (g)','Cost','Sell','Status','Location','Actions'], list.map(i=>{const cat=JEWELRY_CATEGORIES.find(c=>c.id===i.category); const catIcon=cat?JEWELRY_ICONS[cat.icon]:''; return `<tr><td><code class="mono">${esc(i.sku)}</code></td><td><code class="mono">${esc(i.code)}</code></td><td>${esc(i.name)}</td><td><span class="category-badge ${i.category}">${catIcon}<span class="nav-label">${cat?t(cat.label):i.category}</span></span></td><td>${esc(lt(i.metalType||i.metal||''))}</td><td class="mono">${esc(i.purity)}</td><td class="mono align-right">${num(i.netWeight||i.weight).toFixed(3)}</td><td class="mono align-right">${money(calcItem.totalCost(i))}</td><td class="mono align-right">${money(i.sellingPrice)}</td><td><span class="badge badge-${i.status}">${esc(lt(i.status))}</span></td><td>${esc(lt(i.location||''))}</td><td><button class="btn btn-ghost btn-sm" data-inv-edit="${esc(i.id)}" title="Edit">${icon('edit')}</button> <button class="btn btn-ghost btn-sm" data-inv-delete="${esc(i.id)}" title="Delete">${icon('trash')}</button></td></tr>`;}).join(''))}</div></div>`;
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Inventory')}</h2></div><div class="card-body"><div class="toolbar" style="display:flex;gap:var(--space-3);flex-wrap:wrap;margin-bottom:var(--space-5)"><input type="search" id="invSearch" class="field-input" placeholder="Search items..." value="${esc(searchQuery)}" style="max-width:300px">${select('invFilterCategory','', ['all',...JEWELRY_CATEGORIES.map(c=>({value:c.id,label:t(c.label)}))], filterCategory)}${select('invFilterStatus','', [{value:'all',label:t('All')},...STATUS_OPTIONS.map(v=>({value:v,label:t(v)}))], filterStatus)}${select('invFilterMetal','', [{value:'all',label:t('All')},...metals.map(v=>({value:v,label:lt(v)}))], filterMetal)}${select('invFilterPurity','', ['all',...purities], filterPurity)}${select('invSortBy','', [{value:'createdAt',label:t('Newest first')},{value:'name',label:t('Name')},{value:'sku',label:t('SKU')},{value:'netWeight',label:t('Net weight')},{value:'sellingPrice',label:t('Selling Price')},{value:'status',label:t('Status')}], sortBy)}<button class="btn btn-ghost btn-sm" data-inv-sort-dir="${sortDir}" title="${sortDir==='asc'?t('Ascending'):t('Descending')}">${sortDir==='asc'?'↑':'↓'}</button></div><div id="invList" class="inv-list">${renderInventoryList(list)}</div></div></div>`;
 }
 
 function pos(){
@@ -597,18 +654,18 @@ function pos(){
   const cartTotals=calcCartTotals(cart);
   const currentRates=state.rates;
   return `
-<div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.pos[0]}</h1><p class="page-subtitle">${PAGE_TITLES.pos[1]}</p></div><div class="page-header-actions"><button class="btn btn-secondary" data-pos-clear-cart ${cart.length?'':'style="display:none"'}>Clear Cart</button><button class="btn btn-champagne" data-pos-new-customer>New Customer</button></div></div></div>
+<div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.pos[0]}</h1><p class="page-subtitle">${PAGE_TITLES.pos[1]}</p></div><div class="page-header-actions"><button class="btn btn-secondary" data-pos-clear-cart ${cart.length?'':'style="display:none"'}>${t('Clear Cart')}</button><button class="btn btn-champagne" data-pos-new-customer>${t('New Customer')}</button></div></div></div>
 <div class="layout"><div>
-  <div class="card"><div class="card-header"><h2 class="card-title">Rates</h2></div><div class="card-body"><form id="posRates" class="form">${input('gold','Gold Rate','number',currentRates.gold,'min="0" step="0.01"')}${input('silver','Silver Rate','number',currentRates.silver,'min="0" step="0.01"')}<div class="field-full"><button class="btn btn-primary" type="submit">Update Rates & Recalculate</button></div></form></div></div>
-  <div class="card section"><div class="card-header"><h2 class="card-title">Items</h2></div><div class="card-body"><input type="search" id="posItemSearch" class="field-input" placeholder="Search items..." style="margin-bottom:var(--space-3)"><div style="max-height:300px;overflow:auto">${rows(['SKU','Name','Category','Metal','Purity','Net','Sell','Action'], availableStock.filter(i=>{const q=(state.posItemSearch||'').toLowerCase(); return !q || [i.sku,i.name,i.code].join(' ').toLowerCase().includes(q);}).map(i=>{const cat=JEWELRY_CATEGORIES.find(c=>c.id===i.category); const catIcon=cat?JEWELRY_ICONS[cat.icon]:''; return `<tr><td><code class="mono">${esc(i.sku)}</code></td><td>${esc(i.name)}</td><td><span class="category-badge ${i.category}">${catIcon}<span class="nav-label">${cat?t(cat.label):i.category}</span></span></td><td>${esc(lt(i.metalType||i.metal))}</td><td class="mono">${esc(i.purity)}</td><td class="mono align-right">${num(i.netWeight||i.weight).toFixed(3)}</td><td class="mono align-right">${money(i.sellingPrice||price(i))}</td><td><button class="btn btn-champagne btn-sm" data-pos-add-item="${esc(i.id)}">Add</button></td></tr>`;}).join(''))}</div></div></div>
-  <div class="card section"><div class="card-header"><h2 class="card-title">Customer</h2></div><div class="card-body"><select class="field-select" id="posCustomerSelect"><option value="">Walk-in Customer</option>${customers.map(c=>`<option value="${esc(c.id)}">${esc(c.name)} ${c.phone?'('+esc(c.phone)+')':''}</option>`).join('')}</select><div id="posCustomerDetails" style="display:none;margin-top:12px"></div></div></div>
+  <div class="card"><div class="card-header"><h2 class="card-title">${t('Rates')}</h2></div><div class="card-body"><form id="posRates" class="form">${input('gold',`${t('Gold')} ${t('Rate')}`,'number',currentRates.gold,'min="0" step="0.01"')}${input('silver',`${t('Silver')} ${t('Rate')}`,'number',currentRates.silver,'min="0" step="0.01"')}<div class="field-full"><button class="btn btn-primary" type="submit">${t('Update Rates & Recalculate')}</button></div></form></div></div>
+  <div class="card section"><div class="card-header"><h2 class="card-title">${t('Items')}</h2></div><div class="card-body"><input type="search" id="posItemSearch" class="field-input" placeholder="${t('Search items...')}" style="margin-bottom:var(--space-3)"><div style="max-height:300px;overflow:auto">${rows([t('SKU'),t('Name'),t('Category'),t('Metal'),t('Purity'),t('Net'),t('Sell'),t('Action')], availableStock.filter(i=>{const q=(state.posItemSearch||'').toLowerCase(); return !q || [i.sku,i.name,i.code].join(' ').toLowerCase().includes(q);}).map(i=>{const cat=JEWELRY_CATEGORIES.find(c=>c.id===i.category); const catIcon=cat?JEWELRY_ICONS[cat.icon]:''; return `<tr><td><code class="mono">${esc(i.sku)}</code></td><td>${esc(i.name)}</td><td><span class="category-badge ${i.category}">${catIcon}<span class="nav-label">${cat?t(cat.label):i.category}</span></span></td><td>${esc(lt(i.metalType||i.metal))}</td><td class="mono">${esc(i.purity)}</td><td class="mono align-right">${num(i.netWeight||i.weight).toFixed(3)}</td><td class="mono align-right">${money(i.sellingPrice||price(i))}</td><td><button class="btn btn-champagne btn-sm" data-pos-add-item="${esc(i.id)}">${t('Add')}</button></td></tr>`;}).join(''))}</div></div></div>
+  <div class="card section"><div class="card-header"><h2 class="card-title">${t('Customer')}</h2></div><div class="card-body"><select class="field-select" id="posCustomerSelect"><option value="">${t('Walk-in Customer')}</option>${customers.map(c=>`<option value="${esc(c.id)}">${esc(c.name)} ${c.phone?'('+esc(c.phone)+')':''}</option>`).join('')}</select><div id="posCustomerDetails" style="display:none;margin-top:12px"></div></div></div>
 </div><div style="width:420px;flex-shrink:0">
   <div class="card"><div class="card-header"><h2 class="card-title">${t('Cart')} (${cart.length})</h2></div><div class="card-body">${cart.length?`<table class="table"><thead><tr><th>Item</th><th>Qty</th><th>Total</th><th></th></tr></thead><tbody>${cart.map((c,idx)=>`<tr><td>${esc(c.item.name)}<div class="small muted mono">${esc(c.item.sku)}</div></td><td><input type="number" class="field-input" style="width:70px" value="${c.qty}" min="1" data-pos-qty="${idx}"></td><td class="mono align-right">${money(c.total)}</td><td><button class="btn btn-ghost btn-sm" data-pos-remove-item="${idx}">×</button></td></tr>`).join('')}</tbody></table>`:`<p class="muted">${t('Cart is empty')}</p>`}
   <div style="margin-top:12px">${t('Subtotal:')} <strong class="mono">${money(cartTotals.subtotal)}</strong><br>${t('Discount:')} <strong class="mono">${money(cartTotals.discount)}</strong><br>${t('Tax:')} <strong class="mono">${money(cartTotals.tax)}</strong><br>${t('Grand Total:')} <strong class="mono" style="color:var(--gold-primary)">${money(cartTotals.total)}</strong></div>
-  <div class="field" style="margin-top:12px"><label class="field-label">Extra Discount %</label><input class="field-input" id="posExtraDiscount" type="number" value="0" min="0" max="100" step="0.1"></div>
-  <div style="margin-top:12px"><label class="field-label">Payments</label><div id="posPaymentRows">${cart.length?`<div class="payment-row" style="display:flex;gap:8px;margin-bottom:8px"><select class="field-select" name="payMethod" style="flex:1">${PAYMENT_METHODS.map(m=>`<option value="${m}">${m}</option>`).join('')}</select><input class="field-input" name="payAmount" type="number" style="width:120px" min="0" step="0.01" value="${cartTotals.total.toFixed(2)}"><button type="button" class="btn btn-ghost btn-sm" data-pos-remove-pay>×</button></div>`:''}</div><button type="button" class="btn btn-secondary btn-sm" data-pos-add-pay style="width:100%">${t('Add Payment')}</button><div id="posPaymentSummary" style="margin-top:8px"></div></div>
-  <div style="display:flex;gap:8px;margin-top:12px"><button class="btn btn-gold" style="flex:1" data-pos-checkout>Complete Sale</button><button class="btn btn-secondary" data-pos-save-quote>Save Quote</button></div></div></div>
-  <div class="card section"><div class="card-header"><h2 class="card-title">Recent Sales</h2></div><div class="card-body" style="padding:0;max-height:280px;overflow:auto">${rows(['Invoice','Date','Customer','Total','Actions'], state.sales.slice(0,10).map(s=>`<tr><td><code class="mono">${esc(s.invoice)}</code></td><td class="mono">${fmtDate(s.date)}</td><td>${esc(s.customerName||s.customer||'-')}</td><td class="mono align-right">${money(s.total)}</td><td><button class="btn btn-ghost btn-sm" data-pos-view-invoice="${esc(s.id)}">View</button></td></tr>`).join(''))}</div></div>
+<div class="field" style="margin-top:12px"><label class="field-label">${t('Extra Discount %')}</label><input class="field-input" id="posExtraDiscount" type="number" value="0" min="0" max="100" step="0.1"></div>
+<div style="margin-top:12px"><label class="field-label">${t('Payments')}</label><div id="posPaymentRows">${cart.length?`<div class="payment-row" style="display:flex;gap:8px;margin-bottom:8px"><select class="field-select" name="payMethod" style="flex:1">${PAYMENT_METHODS.map(m=>`<option value="${m}">${m}</option>`).join('')}</select><input class="field-input" name="payAmount" type="number" style="width:120px" min="0" step="0.01" value="${cartTotals.total.toFixed(2)}"><button type="button" class="btn btn-ghost btn-sm" data-pos-remove-pay>×</button></div>`:''}</div><button type="button" class="btn btn-secondary btn-sm" data-pos-add-pay style="width:100%">${t('Add Payment')}</button><div id="posPaymentSummary" style="margin-top:8px"></div></div>
+<div style="display:flex;gap:8px;margin-top:12px"><button class="btn btn-champagne" style="flex:1" data-pos-checkout>${t('Complete Sale')}</button><button class="btn btn-secondary" data-pos-save-quote>${t('Save Quote')}</button></div></div></div>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Recent Sales')}</h2></div><div class="card-body" style="padding:0;max-height:280px;overflow:auto">${rows([t('Invoice'),t('Date'),t('Customer'),t('Total'),t('Actions')], state.sales.slice(0,10).map(s=>`<tr><td><code class="mono">${esc(s.invoice)}</code></td><td class="mono">${fmtDate(s.date)}</td><td>${esc(s.customerName||s.customer||'-')}</td><td class="mono align-right">${money(s.total)}</td><td><button class="btn btn-ghost btn-sm" data-pos-view-invoice="${esc(s.id)}">${t('View')}</button></td></tr>`).join(''))}</div></div>
 </div></div>`;
 }
 
@@ -634,19 +691,19 @@ function metals(){
   const goldValue=rnd(totalGold*num(state.rates.gold)); const silverValue=rnd(totalSilver*num(state.rates.silver));
   const balanceRows=Object.values(balances).map(b=>`<tr><td>${esc(b.metal)}</td><td class="mono">${esc(b.purity)}</td><td class="mono align-right">${b.opening.toFixed(3)} g</td><td class="mono align-right"><strong>${b.balance.toFixed(3)} g</strong></td><td class="mono align-right">${money(b.metal==='Gold'?num(state.rates.gold):num(state.rates.silver))}</td><td class="mono align-right">${money(b.balance*(b.metal==='Gold'?num(state.rates.gold):num(state.rates.silver)))}</td></tr>`).join('');
   return `
-<div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.metals[0]}</h1><p class="page-subtitle">${PAGE_TITLES.metals[1]}</p></div><div class="page-header-actions"><button class="btn btn-secondary" data-metal-export>Export CSV</button><button class="btn btn-secondary" data-metal-post-period>Post Period</button><button class="btn btn-champagne" data-metal-add>New Transaction</button></div></div></div>
-<div class="metric-grid">${card('Total Gold', totalGold.toFixed(3)+' g', t('Value')+' '+money(goldValue))}${card('Total Silver', totalSilver.toFixed(3)+' g', t('Value')+' '+money(silverValue))}${card('Transactions', txns.length, `${t('Posted')} ${txns.filter(x=>x.posted).length}`)}${card('Combined Value', money(goldValue+silverValue), 'At current rates')}</div>
-<div class="card"><div class="card-header"><h2 class="card-title">Current Balances by Purity</h2></div><div class="card-body" style="padding:0">${rows(['Metal','Purity','Opening','Current','Rate/g','Value'], balanceRows)}</div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Transaction History</h2></div><div class="card-body"><div class="toolbar" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px"><input type="search" id="metalSearch" class="field-input" placeholder="Search..." value="${esc(state.metalSearch||'')}" style="max-width:240px">${select('metalFilterMetal','',[{value:'all',label:t('All')},{value:'Gold',label:t('Gold')},{value:'Silver',label:t('Silver')}],filterMetal)}${select('metalFilterType','',['all',...typeOptions],filterType)}${select('metalFilterPurity','',['all',...allPurities],filterPurity)}${select('metalFilterPosted','',['all','posted','unposted'],filterPosted)}</div><div style="max-height:480px;overflow:auto">${rows(['Date','Type','Metal','Purity','Weight','Rate','Value','Reference','Karigar/Job','Status','Actions'], filtered.map(t=>{const typeInfo=METAL_TXN_TYPES.find(x=>x.value===t.type)||{}; const editable=canEditTransaction(t); return `<tr><td class="mono">${esc(t.date||'')}</td><td><span class="badge" style="background:${typeInfo.color||'var(--bg-elevated)'}22">${esc(lt(typeInfo.label||t.type))}</span></td><td>${esc(t.metal)}</td><td class="mono">${esc(t.purity)}</td><td class="mono align-right">${num(t.weight).toFixed(3)} ${esc(t.unit||'g')}</td><td class="mono align-right">${t.rate?money(t.rate):'-'}</td><td class="mono align-right">${t.value?money(t.value):'-'}</td><td><code class="mono">${esc(t.reference||'-')}</code></td><td>${esc(t.karigar||t.jobCode||'-')}</td><td>${t.posted?`<span class="badge badge-completed">${lt('Posted')}</span>`:`<span class="badge badge-warn">${lt('Draft')}</span>`}</td><td>${editable?`<button class="btn btn-ghost btn-sm" data-metal-edit="${esc(t.id)}">${lt('Edit')}</button> <button class="btn btn-ghost btn-sm" data-metal-delete="${esc(t.id)}">${lt('Delete')}</button>`:''}</td></tr>`;}).join(''))}</div><p class="note note-caution" style="margin-top:12px">${t('Job metal issues/returns/wastage are recorded as ledger transactions automatically and affect balances.')}</p></div></div>`;
+<div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.metals[0]}</h1><p class="page-subtitle">${PAGE_TITLES.metals[1]}</p></div><div class="page-header-actions"><button class="btn btn-secondary" data-metal-export>${t('Export CSV')}</button><button class="btn btn-secondary" data-metal-post-period>${t('Post Period')}</button><button class="btn btn-champagne" data-metal-add>${t('New Transaction')}</button></div></div></div>
+<div class="metric-grid">${card(t('Total Gold'), totalGold.toFixed(3)+' g', t('Value')+' '+money(goldValue))}${card(t('Total Silver'), totalSilver.toFixed(3)+' g', t('Value')+' '+money(silverValue))}${card(t('Transactions'), txns.length, `${t('Posted')} ${txns.filter(x=>x.posted).length}`)}${card(t('Combined Value'), money(goldValue+silverValue), t('At current rates'))}</div>
+<div class="card"><div class="card-header"><h2 class="card-title">${t('Current Balances by Purity')}</h2></div><div class="card-body" style="padding:0">${rows([t('Metal'),t('Purity'),t('Opening'),t('Current'),t('Rate/g'),t('Value')], balanceRows)}</div></div>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Transaction History')}</h2></div><div class="card-body"><div class="toolbar" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px"><input type="search" id="metalSearch" class="field-input" placeholder="${t('Search...')}" value="${esc(state.metalSearch||'')}" style="max-width:240px">${select('metalFilterMetal','',[{value:'all',label:t('All')},{value:'Gold',label:t('Gold')},{value:'Silver',label:t('Silver')}],filterMetal)}${select('metalFilterType','',['all',...typeOptions],filterType)}${select('metalFilterPurity','',['all',...allPurities],filterPurity)}${select('metalFilterPosted','',['all',t('Posted'),t('Unposted')],filterPosted)}</div><div style="max-height:480px;overflow:auto">${rows([t('Date'),t('Type'),t('Metal'),t('Purity'),t('Weight'),t('Rate'),t('Value'),t('Reference'),t('Karigar/Job'),t('Status'),t('Actions')], filtered.map(t=>{const typeInfo=METAL_TXN_TYPES.find(x=>x.value===t.type)||{}; const editable=canEditTransaction(t); return `<tr><td class="mono">${esc(t.date||'')}</td><td><span class="badge" style="background:${typeInfo.color||'var(--bg-elevated)'}22">${esc(lt(typeInfo.label||t.type))}</span></td><td>${esc(t.metal)}</td><td class="mono">${esc(t.purity)}</td><td class="mono align-right">${num(t.weight).toFixed(3)} ${esc(t.unit||'g')}</td><td class="mono align-right">${t.rate?money(t.rate):'-'}</td><td class="mono align-right">${t.value?money(t.value):'-'}</td><td><code class="mono">${esc(t.reference||'-')}</code></td><td>${esc(t.karigar||t.jobCode||'-')}</td><td>${t.posted?`<span class="badge badge-completed">${lt('Posted')}</span>`:`<span class="badge badge-warn">${lt('Draft')}</span>`}</td><td>${editable?`<button class="btn btn-ghost btn-sm" data-metal-edit="${esc(t.id)}">${lt('Edit')}</button> <button class="btn btn-ghost btn-sm" data-metal-delete="${esc(t.id)}">${lt('Delete')}</button>`:''}</td></tr>`;}).join(''))}</div><p class="note note-caution" style="margin-top:12px">${t('Job metal issues/returns/wastage are recorded as ledger transactions automatically and affect balances.')}</p></div></div>`;
 }
 
 function exchange(){
   return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.exchange[0]}</h1><p class="page-subtitle">${PAGE_TITLES.exchange[1]}</p></div></div></div>
 <div class="layout"><div>
-  <div class="card"><div class="card-header"><h2 class="card-title">Record Old-Gold Receipt</h2></div><div class="card-body"><form id="exchange" class="form">${input('customer','Customer Name')}${input('weight','Net Metal Weight (g)','number','','min="0.001" step="0.001"')}${select('purity','Assessed Purity',['24','22','21','20','18','14','12','9'])}${input('rate','Agreed Rate per Fine Gram (NPR)','number',state.rates.gold,'min="0" step="0.01"')}${input('deduction','Agreed Deduction (NPR)','number','0','min="0" step="0.01"')}${textarea('notes','Assessment / Test Notes')}<div class="field-full"><button class="btn btn-champagne" type="submit" style="width:100%">Record Receipt</button></div></form><p class="note note-caution" style="margin-top:12px">Receipt register for pilot. Link to metal ledger manually if needed via Metal Management.</p></div></div>
+  <div class="card"><div class="card-header"><h2 class="card-title">${t('Record Old-Gold Receipt')}</h2></div><div class="card-body"><form id="exchange" class="form">${input('customer',t('Customer Name'))}${input('weight',t('Net Metal Weight (g)'),'number','','min="0.001" step="0.001"')}${select('purity',t('Assessed Purity'),['24','22','21','20','18','14','12','9'])}${input('rate',t('Agreed Rate per Fine Gram (NPR)'),'number',state.rates.gold,'min="0" step="0.01"')}${input('deduction',t('Agreed Deduction (NPR)'),'number','0','min="0" step="0.01"')}${textarea('notes',t('Assessment / Test Notes'))}<div class="field-full"><button class="btn btn-champagne" type="submit" style="width:100%">${t('Record Receipt')}</button></div></form><p class="note note-caution" style="margin-top:12px">${t('Receipt register for pilot. Link to metal ledger manually if needed via Metal Management.')}</p></div></div>
 </div><div>
-  <div class="card"><div class="card-header"><h2 class="card-title">Old-Gold Receipts</h2></div><div class="card-body" style="padding:0">${rows(['Customer','Weight','Purity','Value'], state.exchanges.map(x=>`<tr><td>${esc(x.customer)}</td><td class="mono">${num(x.weight).toFixed(3)} g</td><td class="mono">${x.purity}K</td><td class="align-right mono">${money(x.value)}</td></tr>`).join(''))}</div></div>
+  <div class="card"><div class="card-header"><h2 class="card-title">${t('Old-Gold Receipts')}</h2></div><div class="card-body" style="padding:0">${rows([t('Customer'),t('Weight'),t('Purity'),t('Value')], state.exchanges.map(x=>`<tr><td>${esc(x.customer)}</td><td class="mono">${num(x.weight).toFixed(3)} g</td><td class="mono">${x.purity}K</td><td class="align-right mono">${money(x.value)}</td></tr>`).join(''))}</div></div>
 </div></div>`;
 }
 
@@ -705,27 +762,27 @@ function reports(){
 
     return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.reports[0]} - ${t('Sales Report')}</h1><p class="page-subtitle">${PAGE_TITLES.reports[1]} ${dateRangeLabel}</p></div><div class="page-header-actions">
-  <button class="btn btn-champagne" data-report-export-csv="sales">Export CSV</button>
-  <button class="btn btn-outline-champagne" data-report-export-pdf="sales">Export PDF</button>
+  <button class="btn btn-champagne" data-report-export-csv="sales">${t('Export CSV')}</button>
+  <button class="btn btn-outline-champagne" data-report-export-pdf="sales">${t('Export PDF')}</button>
 </div></div></div>
 <div class="metric-grid">
-  ${card('Total Sales', money(totalSales), `${sales.length} ${t('invoices')}`)}
-  ${card('Total Tax', money(totalTax), `${t(state.settings.taxLabel)} @ ${state.settings.taxRate}%`)}
-  ${card('Total Discount', money(totalDiscount))}
-  ${card('Avg Sale Value', money(avgSale), `${totalItems} ${t('items sold')}`)}
+  ${card(t('Total Sales'), money(totalSales), `${sales.length} ${t('invoices')}`)}
+  ${card(t('Total Tax'), money(totalTax), `${t(state.settings.taxLabel)} @ ${state.settings.taxRate}%`)}
+  ${card(t('Total Discount'), money(totalDiscount))}
+  ${card(t('Avg Sale Value'), money(avgSale), `${totalItems} ${t('items sold')}`)}
 </div>
 <div class="layout">
   <div>
-    <div class="card"><div class="card-header"><h2 class="card-title">Sales by Payment Method</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Method','Amount','%'], Object.entries(byPayment).map(([m,v])=>`<tr><td>${esc(m)}</td><td class="mono align-right">${money(v)}</td><td class="mono align-right">${totalSales?rnd(v/totalSales*100):0}%</td></tr>`).join('') || `<tr><td colspan="3" class="align-center">${t('No data')}</td></tr>`)}
+    <div class="card"><div class="card-header"><h2 class="card-title">${t('Sales by Payment Method')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Method'),t('Amount'),t('%')], Object.entries(byPayment).map(([m,v])=>`<tr><td>${esc(m)}</td><td class="mono align-right">${money(v)}</td><td class="mono align-right">${totalSales?rnd(v/totalSales*100):0}%</td></tr>`).join('') || `<tr><td colspan="3" class="align-center">${t('No data')}</td></tr>`)}
     </div></div>
-    <div class="card"><div class="card-header"><h2 class="card-title">Sales by Metal Type</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Metal Type','Amount','%'], Object.entries(byMetal).filter(([,v])=>v>0).map(([m,v])=>`<tr><td>${esc(m)}</td><td class="mono align-right">${money(v)}</td><td class="mono align-right">${totalSales?rnd(v/totalSales*100):0}%</td></tr>`).join('') || `<tr><td colspan="3" class="align-center">${t('No data')}</td></tr>`)}
+    <div class="card"><div class="card-header"><h2 class="card-title">${t('Sales by Metal Type')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Metal Type'),t('Amount'),t('%')], Object.entries(byMetal).filter(([,v])=>v>0).map(([m,v])=>`<tr><td>${esc(m)}</td><td class="mono align-right">${money(v)}</td><td class="mono align-right">${totalSales?rnd(v/totalSales*100):0}%</td></tr>`).join('') || `<tr><td colspan="3" class="align-center">${t('No data')}</td></tr>`)}
     </div></div>
   </div>
   <div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Sales Detail</h2></div><div class="card-body" style="padding:0;max-height:500px;overflow:auto">
-      ${rows(['Date','Invoice','Customer','Items','Subtotal','Discount','Tax','Total','Payments'], sales.map(s=>`<tr>
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Sales Detail')}</h2></div><div class="card-body" style="padding:0;max-height:500px;overflow:auto">
+      ${rows([t('Date'),t('Invoice'),t('Customer'),t('Items'),t('Subtotal'),t('Discount'),t('Tax'),t('Total'),t('Payments')], sales.map(s=>`<tr>
         <td class="mono">${fmtDate(s.date)}</td>
         <td><code class="mono">${esc(s.invoice)}</code></td>
         <td>${esc(s.customerName||s.customer||'Walk-in')}</td>
@@ -739,7 +796,7 @@ function reports(){
     </div></div>
   </div>
 </div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Filters</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Filters')}</h2></div><div class="card-body">
   <form id="salesFilter" class="form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
     ${input('reportStartDate','From','date',startDate,'')}
     ${input('reportEndDate','To','date',endDate,'')}
@@ -784,29 +841,29 @@ function reports(){
     return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.reports[0]} - Purchase Report</h1><p class="page-subtitle">Metal purchases from suppliers ${dateRangeLabel}</p></div><div class="page-header-actions">
   <button class="btn btn-champagne" data-report-export-csv="purchases">Export CSV</button>
-  <button class="btn btn-secondary" data-report-export-pdf="purchases">Export PDF</button>
+  <button class="btn btn-secondary" data-report-export-pdf="purchases">${t('Export PDF')}</button>
 </div></div></div>
 <div class="metric-grid">
-  ${card('Total Purchases', money(totalValue), `${purchases.length} transactions`)}
-  ${card('Total Weight', totalWeight.toFixed(3) + ' g', `Avg rate: ${money(avgRate)}/g`)}
-  ${card('Gold Purchased', byMetal.Gold.weight.toFixed(3) + ' g', money(byMetal.Gold.value))}
-  ${card('Silver Purchased', byMetal.Silver.weight.toFixed(3) + ' g', money(byMetal.Silver.value))}
+  ${card(t('Total Purchases'), money(totalValue), `${purchases.length} ${t('transactions')}`)}
+  ${card(t('Total Weight'), totalWeight.toFixed(3) + ' g', `${t('Avg rate')}: ${money(avgRate)}/g`)}
+  ${card(t('Gold Purchased'), byMetal.Gold.weight.toFixed(3) + ' g', money(byMetal.Gold.value))}
+  ${card(t('Silver Purchased'), byMetal.Silver.weight.toFixed(3) + ' g', money(byMetal.Silver.value))}
 </div>
 <div class="layout">
   <div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Purchases by Supplier</h2></div><div class="card-body" style="padding:0;max-height:400px;overflow:auto">
-      ${rows(['Supplier','Transactions','Weight (g)','Value','Avg Rate/g'], Object.entries(bySupplier).map(([s,v])=>`<tr>
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Purchases by Supplier')}</h2></div><div class="card-body" style="padding:0;max-height:400px;overflow:auto">
+      ${rows([t('Supplier'),t('Transactions'),t('Weight (g)'),t('Value'),t('Avg Rate/g')], Object.entries(bySupplier).map(([s,v])=>`<tr>
         <td>${esc(s)}</td>
         <td class="mono align-right">${v.count}</td>
         <td class="mono align-right">${v.weight.toFixed(3)}</td>
         <td class="mono align-right">${money(v.value)}</td>
         <td class="mono align-right">${money(v.weight?v.value/v.weight:0)}</td>
-      </tr>`).join('') || '<tr><td colspan="5" class="align-center">No purchases in period</td></tr>')}
+      </tr>`).join('') || `<tr><td colspan="5" class="align-center">${t('No purchases in period')}</td></tr>`)}
     </div></div>
   </div>
   <div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Purchase Detail</h2></div><div class="card-body" style="padding:0;max-height:400px;overflow:auto">
-      ${rows(['Date','Type','Metal','Purity','Weight (g)','Rate/g','Value','Supplier','Reference','Notes'], purchases.map(t=>`<tr>
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Purchase Detail')}</h2></div><div class="card-body" style="padding:0;max-height:400px;overflow:auto">
+      ${rows([t('Date'),t('Type'),t('Metal'),t('Purity'),t('Weight (g)'),t('Rate/g'),t('Value'),t('Supplier'),t('Reference'),t('Notes')], purchases.map(t=>`<tr>
         <td class="mono">${esc(t.date||'')}</td>
         <td>${esc(lt((METAL_TXN_TYPES.find(x=>x.value===t.type)||{}).label||t.type))}</td>
         <td>${esc(t.metal)}</td>
@@ -821,7 +878,7 @@ function reports(){
     </div></div>
   </div>
 </div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Filters</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Filters')}</h2></div><div class="card-body">
   <form id="purchaseFilter" class="form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
     ${input('reportStartDate','From','date',startDate,'')}
     ${input('reportEndDate','To','date',endDate,'')}
@@ -866,40 +923,40 @@ function reports(){
     return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.reports[0]} - Stock Valuation</h1><p class="page-subtitle">Current inventory valuation at cost and selling price ${dateRangeLabel}</p></div><div class="page-header-actions">
   <button class="btn btn-champagne" data-report-export-csv="stock">Export CSV</button>
-  <button class="btn btn-secondary" data-report-export-pdf="stock">Export PDF</button>
+  <button class="btn btn-secondary" data-report-export-pdf="stock">${t('Export PDF')}</button>
 </div></div></div>
 <div class="metric-grid">
-  ${card('Total Items', totalItems + ' pcs', `${totalWeight.toFixed(3)} g total weight`)}
-  ${card('Stock at Cost', money(totalCost), 'Weighted average cost')}
-  ${card('Stock at Selling', money(totalSelling), `Potential margin: ${potentialMargin}%`)}
-  ${card('Potential Profit', money(rnd(totalSelling - totalCost)), 'If all sold at marked price')}
+  ${card(t('Total Items'), totalItems + ' pcs', `${totalWeight.toFixed(3)} g ${t('total weight')}`)}
+  ${card(t('Stock at Cost'), money(totalCost), t('Weighted average cost'))}
+  ${card(t('Stock at Selling'), money(totalSelling), `${t('Potential margin')}: ${potentialMargin}%`)}
+  ${card(t('Potential Profit'), money(rnd(totalSelling - totalCost)), t('If all sold at marked price'))}
 </div>
 <div class="layout">
   <div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Valuation by Category</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Category','Items','Weight (g)','Cost Value','Selling Value','Margin %'], Object.entries(byCat).map(([c,v])=>`<tr>
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Valuation by Category')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Category'),t('Items'),t('Weight (g)'),t('Cost Value'),t('Selling Value'),t('Margin %')], Object.entries(byCat).map(([c,v])=>`<tr>
         <td>${esc(c.charAt(0).toUpperCase()+c.slice(1))}</td>
         <td class="mono align-right">${v.count}</td>
         <td class="mono align-right">${v.weight.toFixed(3)}</td>
         <td class="mono align-right">${money(v.cost)}</td>
         <td class="mono align-right">${money(v.selling)}</td>
         <td class="mono align-right">${v.selling?rnd((v.selling-v.cost)/v.selling*100):0}%</td>
-      </tr>`).join('') || '<tr><td colspan="6" class="align-center">No stock</td></tr>')}
+      </tr>`).join('') || `<tr><td colspan="6" class="align-center">${t('No stock')}</td></tr>`)}
     </div></div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Valuation by Metal</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Metal','Items','Weight (g)','Cost Value','Selling Value','Margin %'], Object.entries(byMetal).filter(([,v])=>v.count>0).map(([m,v])=>`<tr>
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Valuation by Metal')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Metal'),t('Items'),t('Weight (g)'),t('Cost Value'),t('Selling Value'),t('Margin %')], Object.entries(byMetal).filter(([,v])=>v.count>0).map(([m,v])=>`<tr>
         <td>${esc(m)}</td>
         <td class="mono align-right">${v.count}</td>
         <td class="mono align-right">${v.weight.toFixed(3)}</td>
         <td class="mono align-right">${money(v.cost)}</td>
         <td class="mono align-right">${money(v.selling)}</td>
         <td class="mono align-right">${v.selling?rnd((v.selling-v.cost)/v.selling*100):0}%</td>
-      </tr>`).join('') || '<tr><td colspan="6" class="align-center">No stock</td></tr>')}
+      </tr>`).join('') || `<tr><td colspan="6" class="align-center">${t('No stock')}</td></tr>`)}
     </div></div>
   </div>
   <div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Stock Detail</h2></div><div class="card-body" style="padding:0;max-height:500px;overflow:auto">
-      ${rows(['SKU','Name','Category','Metal','Purity','Net (g)','Cost','Selling','Margin %','Location'], items.map(i=>`<tr>
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Stock Detail')}</h2></div><div class="card-body" style="padding:0;max-height:500px;overflow:auto">
+      ${rows([t('SKU'),t('Name'),t('Category'),t('Metal'),t('Purity'),t('Net (g)'),t('Cost'),t('Selling'),t('Margin %'),t('Location')], items.map(i=>`<tr>
         <td><code class="mono">${esc(i.sku)}</code></td>
         <td>${esc(i.name)}</td>
         <td>${esc(i.category)}</td>
@@ -914,7 +971,7 @@ function reports(){
     </div></div>
   </div>
 </div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Filters</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Filters')}</h2></div><div class="card-body">
   <form id="stockFilter" class="form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
     ${select('reportFilterCategory','Category',['all',...JEWELRY_CATEGORIES.map(c=>({value:c.id,label:c.label}))], filterCategory)}
     ${select('reportFilterMetal','Metal',['all','Gold','Silver','Platinum','Rose Gold','White Gold'], state.reportFilterMetal||'all')}
@@ -947,18 +1004,18 @@ function reports(){
     return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.reports[0]} - Gold/Silver Balances</h1><p class="page-subtitle">Current metal balances with period movement ${dateRangeLabel}</p></div><div class="page-header-actions">
   <button class="btn btn-champagne" data-report-export-csv="metalbalances">Export CSV</button>
-  <button class="btn btn-secondary" data-report-export-pdf="metalbalances">Export PDF</button>
+  <button class="btn btn-secondary" data-report-export-pdf="metalbalances">${t('Export PDF')}</button>
 </div></div></div>
 <div class="metric-grid">
-  ${card('Total Gold', totalGold.toFixed(3) + ' g', 'Value: ' + money(goldValue))}
-  ${card('Total Silver', totalSilver.toFixed(3) + ' g', 'Value: ' + money(silverValue))}
-  ${card('Combined Value', money(goldValue + silverValue), 'At current rates')}
-  ${card('Gold Rate', money(num(state.rates.gold)) + '/g', 'Silver: ' + money(num(state.rates.silver)) + '/g')}
+  ${card(t('Total Gold'), totalGold.toFixed(3) + ' g', t('Value') + ': ' + money(goldValue))}
+  ${card(t('Total Silver'), totalSilver.toFixed(3) + ' g', t('Value') + ': ' + money(silverValue))}
+  ${card(t('Combined Value'), money(goldValue + silverValue), t('At current rates'))}
+  ${card(t('Gold Rate'), money(num(state.rates.gold)) + '/g', t('Silver') + ': ' + money(num(state.rates.silver)) + '/g')}
 </div>
 <div class="layout">
   <div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Gold Balance by Purity</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Purity','Opening','In Period','Out Period','Current Balance','Rate/g','Value'], goldBalances.map(b=>{
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Gold Balance by Purity')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Purity'),t('Opening'),t('In Period'),t('Out Period'),t('Current Balance'),t('Rate/g'),t('Value')], goldBalances.map(b=>{
         const inW = txns.filter(t=>t.metal==='Gold'&&t.purity===b.purity&&['PURCHASE','RETURN','RECEIPT','OPENING_BALANCE'].includes(t.type)).reduce((s,t)=>s+num(t.weight),0);
         const outW = txns.filter(t=>t.metal==='Gold'&&t.purity===b.purity&&['ISSUE','WASTAGE','SALE'].includes(t.type)).reduce((s,t)=>s+num(t.weight),0);
         return `<tr>
@@ -974,8 +1031,8 @@ function reports(){
     </div></div>
   </div>
   <div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Silver Balance by Purity</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Purity','Opening','In Period','Out Period','Current Balance','Rate/g','Value'], silverBalances.map(b=>{
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Silver Balance by Purity')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Purity'),t('Opening'),t('In Period'),t('Out Period'),t('Current Balance'),t('Rate/g'),t('Value')], silverBalances.map(b=>{
         const inW = txns.filter(t=>t.metal==='Silver'&&t.purity===b.purity&&['PURCHASE','RETURN','RECEIPT','OPENING_BALANCE'].includes(t.type)).reduce((s,t)=>s+num(t.weight),0);
         const outW = txns.filter(t=>t.metal==='Silver'&&t.purity===b.purity&&['ISSUE','WASTAGE','SALE'].includes(t.type)).reduce((s,t)=>s+num(t.weight),0);
         return `<tr>
@@ -991,13 +1048,13 @@ function reports(){
     </div></div>
   </div>
 </div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Period Movement Summary</h2></div><div class="card-body" style="padding:0">
-  ${rows(['Metal','Opening','Receipts/Purchases','Issues/Sales/Wastage','Closing','Rate/g','Value'], [
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Period Movement Summary')}</h2></div><div class="card-body" style="padding:0">
+  ${rows([t('Metal'),t('Opening'),t('Receipts/Purchases'),t('Issues/Sales/Wastage'),t('Closing'),t('Rate/g'),t('Value')], [
     ['Gold', totalGold.toFixed(3), goldIn.toFixed(3), goldOut.toFixed(3), totalGold.toFixed(3), money(num(state.rates.gold)), money(goldValue)],
     ['Silver', totalSilver.toFixed(3), silverIn.toFixed(3), silverOut.toFixed(3), totalSilver.toFixed(3), money(num(state.rates.silver)), money(silverValue)]
   ].map(r=>`<tr>${r.map(c=>`<td class="mono align-right">${c}</td>`).join('')}</tr>`).join('') )}
 </div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Filters</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Filters')}</h2></div><div class="card-body">
   <form id="metalBalanceFilter" class="form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
     ${input('reportStartDate','From','date',startDate,'')}
     ${input('reportEndDate','To','date',endDate,'')}
@@ -1035,16 +1092,16 @@ function reports(){
     return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.reports[0]} - Karigar Outstanding</h1><p class="page-subtitle">Metal issued, returned, wastage and labour outstanding ${dateRangeLabel}</p></div><div class="page-header-actions">
   <button class="btn btn-champagne" data-report-export-csv="karigar">Export CSV</button>
-  <button class="btn btn-secondary" data-report-export-pdf="karigar">Export PDF</button>
+  <button class="btn btn-secondary" data-report-export-pdf="karigar">${t('Export PDF')}</button>
 </div></div></div>
 <div class="metric-grid">
-  ${card('Total Metal Issued', totalIssued.toFixed(3) + ' g', 'Across all karigars')}
-  ${card('Total Returned', totalReturned.toFixed(3) + ' g', 'Net: ' + totalNet.toFixed(3) + ' g')}
-  ${card('Total Wastage', totalWastage.toFixed(3) + ' g', 'Actual wastage')}
-  ${card('Labour Outstanding', money(totalOutstanding), `Total labour: ${money(totalLabour)}, Advances: ${money(totalAdvance)}`)}
+  ${card(t('Total Metal Issued'), totalIssued.toFixed(3) + ' g', t('Across all karigars'))}
+  ${card(t('Total Returned'), totalReturned.toFixed(3) + ' g', t('Net') + ': ' + totalNet.toFixed(3) + ' g')}
+  ${card(t('Total Wastage'), totalWastage.toFixed(3) + ' g', t('Actual wastage'))}
+  ${card(t('Labour Outstanding'), money(totalOutstanding), `${t('Total labour')}: ${money(totalLabour)}, ${t('Advances')}: ${money(totalAdvance)}`)}
 </div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Karigar Outstanding Summary</h2></div><div class="card-body" style="padding:0;max-height:500px;overflow:auto">
-  ${rows(['Karigar','Specialty','Rate/g','Active Jobs','Issued (g)','Returned (g)','Net (g)','Wastage (g)','Labour Earned','Advance','Outstanding'], karigars.map(k=>`<tr>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Karigar Outstanding Summary')}</h2></div><div class="card-body" style="padding:0;max-height:500px;overflow:auto">
+  ${rows([t('Karigar'),t('Specialty'),t('Rate/g'),t('Active Jobs'),t('Issued (g)'),t('Returned (g)'),t('Net (g)'),t('Wastage (g)'),t('Labour Earned'),t('Advance'),t('Outstanding')], karigars.map(k=>`<tr>
     <td><strong>${esc(k.karigar.name)}</strong></td>
     <td>${esc((k.karigar.specialties||[]).join(', ')||'-')}</td>
     <td class="mono align-right">${money(num(k.karigar.ratePerGram))}</td>
@@ -1058,7 +1115,7 @@ function reports(){
     <td class="mono align-right ${k.balance<0?'text-danger':''}"><strong>${money(k.balance)}</strong></td>
   </tr>`).join('') || '<tr><td colspan="11" class="align-center">No karigars</td></tr>')}
 </div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Filters</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Filters')}</h2></div><div class="card-body">
   <form id="karigarFilter" class="form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
     ${input('reportStartDate','From','date',startDate,'')}
     ${input('reportEndDate','To','date',endDate,'')}
@@ -1088,16 +1145,16 @@ function reports(){
     return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.reports[0]} - Customer Balances</h1><p class="page-subtitle">Outstanding receivables and credit utilization ${dateRangeLabel}</p></div><div class="page-header-actions">
   <button class="btn btn-champagne" data-report-export-csv="customers">Export CSV</button>
-  <button class="btn btn-secondary" data-report-export-pdf="customers">Export PDF</button>
+  <button class="btn btn-secondary" data-report-export-pdf="customers">${t('Export PDF')}</button>
 </div></div></div>
 <div class="metric-grid">
-  ${card('Total Receivables', money(totalReceivable), `${customers.length} customers with activity`)}
-  ${card('Total Credit Limits', money(totalCreditLimit), 'Combined limits')}
-  ${card('Overdue Accounts', overdueCustomers, 'Exceeding credit limit')}
-  ${card('Avg Utilization', customers.length ? rnd(customers.reduce((s,c)=>s+c.utilization,0)/customers.length) + '%' : '0%', 'Of credit limits')}
+  ${card(t('Total Receivables'), money(totalReceivable), `${customers.length} ${t('customers with activity')}`)}
+  ${card(t('Total Credit Limits'), money(totalCreditLimit), t('Combined limits'))}
+  ${card(t('Overdue Accounts'), overdueCustomers, t('Exceeding credit limit'))}
+  ${card(t('Avg Utilization'), customers.length ? rnd(customers.reduce((s,c)=>s+c.utilization,0)/customers.length) + '%' : '0%', t('Of credit limits'))}
 </div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Customer Balance Detail</h2></div><div class="card-body" style="padding:0;max-height:500px;overflow:auto">
-  ${rows(['Customer','Phone','Sales (Period)','Paid (Period)','Balance','Credit Limit','Utilization','Status'], customers.map(c=>`<tr>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Customer Balance Detail')}</h2></div><div class="card-body" style="padding:0;max-height:500px;overflow:auto">
+  ${rows([t('Customer'),t('Phone'),t('Sales (Period)'),t('Paid (Period)'),t('Balance'),t('Credit Limit'),t('Utilization'),t('Status')], customers.map(c=>`<tr>
     <td><strong>${esc(c.customer.name)}</strong></td>
     <td>${esc(c.customer.phone||'-')}</td>
     <td class="mono align-right">${money(c.totalSales)}</td>
@@ -1108,7 +1165,7 @@ function reports(){
     <td>${c.balance>c.creditLimit&&c.creditLimit>0?'<span class="badge badge-warn">Over Limit</span>':c.balance<0?'<span class="badge badge-completed">Credit</span>':'<span class="badge badge-inprogress">Active</span>'}</td>
   </tr>`).join('') || '<tr><td colspan="8" class="align-center">No customer activity in period</td></tr>')}
 </div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Filters</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Filters')}</h2></div><div class="card-body">
   <form id="customerFilter" class="form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
     ${input('reportStartDate','From','date',startDate,'')}
     ${input('reportEndDate','To','date',endDate,'')}
@@ -1135,16 +1192,16 @@ function reports(){
     return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.reports[0]} - Supplier Balances</h1><p class="page-subtitle">Outstanding payables to metal suppliers ${dateRangeLabel}</p></div><div class="page-header-actions">
   <button class="btn btn-champagne" data-report-export-csv="suppliers">Export CSV</button>
-  <button class="btn btn-secondary" data-report-export-pdf="suppliers">Export PDF</button>
+  <button class="btn btn-secondary" data-report-export-pdf="suppliers">${t('Export PDF')}</button>
 </div></div></div>
 <div class="metric-grid">
-  ${card('Total Payables', money(totalPayable), `${suppliers.length} suppliers`)}
-  ${card('Period Purchases', money(totalPurchaseValue), 'Metal purchases in period')}
-  ${card('Suppliers with Balance', suppliers.filter(s=>s.balance!==0).length, 'Non-zero balances')}
-  ${card('Avg Payment Terms', suppliers.length ? Math.round(suppliers.filter(s=>s.supplier.paymentTerms).reduce((a,s)=>a+num(s.supplier.paymentTerms.match(/\d+/)?.[0]||0),0)/suppliers.filter(s=>s.supplier.paymentTerms).length) + ' days' : 'N/A')}
+  ${card(t('Total Payables'), money(totalPayable), `${suppliers.length} ${t('suppliers')}`)}
+  ${card(t('Period Purchases'), money(totalPurchaseValue), t('Metal purchases in period'))}
+  ${card(t('Suppliers with Balance'), suppliers.filter(s=>s.balance!==0).length, t('Non-zero balances'))}
+  ${card(t('Avg Payment Terms'), suppliers.length ? Math.round(suppliers.filter(s=>s.supplier.paymentTerms).reduce((a,s)=>a+num(s.supplier.paymentTerms.match(/\d+/)?.[0]||0),0)/suppliers.filter(s=>s.supplier.paymentTerms).length) + ' days' : 'N/A')}
 </div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Supplier Balance Detail</h2></div><div class="card-body" style="padding:0;max-height:500px;overflow:auto">
-  ${rows(['Supplier','Contact','Period Purchases','Weight (g)','Balance','Payment Terms','Status'], suppliers.map(s=>`<tr>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Supplier Balance Detail')}</h2></div><div class="card-body" style="padding:0;max-height:500px;overflow:auto">
+  ${rows([t('Supplier'),t('Contact'),t('Period Purchases'),t('Weight (g)'),t('Balance'),t('Payment Terms'),t('Status')], suppliers.map(s=>`<tr>
     <td><strong>${esc(s.supplier.name)}</strong></td>
     <td>${esc(s.supplier.contactPerson||'-')}</td>
     <td class="mono align-right">${money(s.totalPurchases)}</td>
@@ -1154,7 +1211,7 @@ function reports(){
     <td>${s.balance>0?'<span class="badge badge-warn">Payable</span>':s.balance<0?'<span class="badge badge-completed">Advance</span>':'<span class="badge badge-inprogress">Settled</span>'}</td>
   </tr>`).join('') || '<tr><td colspan="7" class="align-center">No supplier activity in period</td></tr>')}
 </div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Filters</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Filters')}</h2></div><div class="card-body">
   <form id="supplierFilter" class="form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
     ${input('reportStartDate','From','date',startDate,'')}
     ${input('reportEndDate','To','date',endDate,'')}
@@ -1186,14 +1243,14 @@ function reports(){
     return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.reports[0]} - Expenses</h1><p class="page-subtitle">Business expenses by category and period ${dateRangeLabel}</p></div><div class="page-header-actions">
   <button class="btn btn-champagne" data-report-export-csv="expenses">Export CSV</button>
-  <button class="btn btn-secondary" data-report-export-pdf="expenses">Export PDF</button>
+  <button class="btn btn-secondary" data-report-export-pdf="expenses">${t('Export PDF')}</button>
   <button class="btn btn-secondary" data-tab="expenses">Manage Expenses</button>
 </div></div></div>
 <div class="metric-grid">
-  ${card('Total Expenses', money(totals.total), `${totals.count} records`)}
-  ${card('Paid', money(byStatus.paid), 'Completed payments')}
-  ${card('Pending', money(byStatus.pending), 'Awaiting payment')}
-  ${card('Overdue', money(byStatus.overdue), 'Past due')}
+  ${card(t('Total Expenses'), money(totals.total), `${totals.count} ${t('records')}`)}
+  ${card(t('Paid'), money(byStatus.paid), t('Completed payments'))}
+  ${card(t('Pending'), money(byStatus.pending), t('Awaiting payment'))}
+  ${card(t('Overdue'), money(byStatus.overdue), t('Past due'))}
 </div>
 <div class="layout">
   <div>
@@ -1219,8 +1276,8 @@ function reports(){
     </div></div>
   </div>
 </div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Expense Detail</h2></div><div class="card-body" style="padding:0;max-height:400px;overflow:auto">
-  ${rows(['Date','Category','Amount','Status','Payment Method','Reference','Notes'], expenses.map(e=>`<tr>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Expense Detail')}</h2></div><div class="card-body" style="padding:0;max-height:400px;overflow:auto">
+  ${rows([t('Date'),t('Category'),t('Amount'),t('Status'),t('Payment Method'),t('Reference'),t('Notes')], expenses.map(e=>`<tr>
     <td class="mono">${fmtDate(e.date)}</td>
     <td>${esc(e.category)}</td>
     <td class="mono align-right">${money(e.amount)}</td>
@@ -1230,7 +1287,7 @@ function reports(){
     <td>${esc(e.notes||'-')}</td>
   </tr>`).join('') || '<tr><td colspan="7" class="align-center">No expenses in period</td></tr>')}
 </div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Filters</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Filters')}</h2></div><div class="card-body">
   <form id="expenseFilter" class="form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
     ${input('reportStartDate','From','date',startDate,'')}
     ${input('reportEndDate','To','date',endDate,'')}
@@ -1289,62 +1346,62 @@ function reports(){
     return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.reports[0]} - Profit & Loss</h1><p class="page-subtitle">Financial performance statement ${dateRangeLabel}</p></div><div class="page-header-actions">
   <button class="btn btn-champagne" data-report-export-csv="pnl">Export CSV</button>
-  <button class="btn btn-secondary" data-report-export-pdf="pnl">Export PDF</button>
+  <button class="btn btn-secondary" data-report-export-pdf="pnl">${t('Export PDF')}</button>
 </div></div></div>
 <div class="metric-grid">
-  ${card('Net Revenue', money(netRevenue), `Gross: ${money(revenue)}, Discounts: ${money(discounts)}`)}
-  ${card('COGS', money(cogs), 'Cost of items sold')}
-  ${card('Gross Profit', money(grossProfit), `Margin: ${grossMargin}%`)}
-  ${card('Net Profit', money(netProfit), `Margin: ${netMargin}%`)}
+  ${card(t('Net Revenue'), money(netRevenue), `${t('Gross')}: ${money(revenue)}, ${t('Discounts')}: ${money(discounts)}`)}
+  ${card(t('COGS'), money(cogs), t('Cost of items sold'))}
+  ${card(t('Gross Profit'), money(grossProfit), `${t('Margin')}: ${grossMargin}%`)}
+  ${card(t('Net Profit'), money(netProfit), `${t('Margin')}: ${netMargin}%`)}
 </div>
 <div class="layout">
   <div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Revenue</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Item','Amount'], [
-        ['Gross Sales', money(revenue)],
-        ['Less: Discounts', money(discounts)],
-        ['Net Revenue', money(netRevenue)],
-        ['Tax Collected (${state.settings.taxLabel})', money(taxCollected)]
-      ].map(r=>`<tr><td>${esc(r[0])}</td><td class="mono align-right ${r[0]==='Net Revenue'?'':'text-danger'}">${r[1]}</td></tr>`).join('') )}
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Revenue')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Item'),t('Amount')], [
+        [t('Gross Sales'), money(revenue)],
+        [t('Less: Discounts'), money(discounts)],
+        [t('Net Revenue'), money(netRevenue)],
+        [`${t('Tax Collected')} (${state.settings.taxLabel})`, money(taxCollected)]
+      ].map(r=>`<tr><td>${esc(r[0])}</td><td class="mono align-right ${r[0]===t('Net Revenue')?'':'text-danger'}">${r[1]}</td></tr>`).join('') )}
     </div></div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Cost of Goods Sold</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Item','Amount'], [
-        ['Cost of Items Sold', money(cogs)],
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Cost of Goods Sold')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Item'),t('Amount')], [
+        [t('Cost of Items Sold'), money(cogs)],
       ].map(r=>`<tr><td>${esc(r[0])}</td><td class="mono align-right text-danger">${r[1]}</td></tr>`).join('') )}
     </div></div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Gross Profit</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Item','Amount'], [
-        ['Net Revenue', money(netRevenue)],
-        ['Less: COGS', money(cogs)],
-        ['Gross Profit', money(grossProfit)],
-        ['Gross Margin', grossMargin + '%']
-      ].map(r=>`<tr><td>${esc(r[0])}</td><td class="mono align-right ${r[0]==='Gross Profit'?'text-success':''}">${r[1]}</td></tr>`).join('') )}
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Gross Profit')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Item'),t('Amount')], [
+        [t('Net Revenue'), money(netRevenue)],
+        [t('Less: COGS'), money(cogs)],
+        [t('Gross Profit'), money(grossProfit)],
+        [t('Gross Margin'), grossMargin + '%']
+      ].map(r=>`<tr><td>${esc(r[0])}</td><td class="mono align-right ${r[0]===t('Gross Profit')?'text-success':''}">${r[1]}</td></tr>`).join('') )}
     </div></div>
   </div>
   <div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Operating Expenses</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Category','Amount'], Object.entries(expensesByCat).map(([c,v])=>`<tr><td>${esc(c)}</td><td class="mono align-right text-danger">${money(v)}</td></tr>`).join('') || '<tr><td colspan="2" class="align-center">No expenses</td></tr>')}
-      ${rows(['Category','Amount'], [['Total Operating Expenses', money(opExpenses)]].map(r=>`<tr style="border-top:2px solid var(--border-strong)"><td><strong>${esc(r[0])}</strong></td><td class="mono align-right"><strong>${r[1]}</strong></td></tr>`).join('') )}
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Operating Expenses')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Category'),t('Amount')], Object.entries(expensesByCat).map(([c,v])=>`<tr><td>${esc(c)}</td><td class="mono align-right text-danger">${money(v)}</td></tr>`).join('') || `<tr><td colspan="2" class="align-center">${t('No expenses')}</td></tr>`)}
+      ${rows([t('Category'),t('Amount')], [[t('Total Operating Expenses'), money(opExpenses)]].map(r=>`<tr style="border-top:2px solid var(--border-strong)"><td><strong>${esc(r[0])}</strong></td><td class="mono align-right"><strong>${r[1]}</strong></td></tr>`).join('') )}
     </div></div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Direct Costs</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Item','Amount'], [
-        ['Karigar Labour', money(labourCost)],
-        ['Metal Wastage', money(wastageCost)],
-        ['Total Direct Costs', money(directCosts)]
-      ].map(r=>`<tr><td>${esc(r[0])}</td><td class="mono align-right ${r[0]==='Total Direct Costs'?'':'text-danger'}">${r[1]}</td></tr>`).join('') )}
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Direct Costs')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Item'),t('Amount')], [
+        [t('Karigar Labour'), money(labourCost)],
+        [t('Metal Wastage'), money(wastageCost)],
+        [t('Total Direct Costs'), money(directCosts)]
+      ].map(r=>`<tr><td>${esc(r[0])}</td><td class="mono align-right ${r[0]===t('Total Direct Costs')?'':'text-danger'}">${r[1]}</td></tr>`).join('') )}
     </div></div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Net Profit</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Item','Amount'], [
-        ['Gross Profit', money(grossProfit)],
-        ['Less: Operating Expenses', money(opExpenses)],
-        ['Less: Direct Costs', money(directCosts)],
-        ['Net Profit / (Loss)', money(netProfit)],
-        ['Net Margin', netMargin + '%']
-      ].map(r=>`<tr style="${r[0]==='Net Profit / (Loss)'?'border-top:2px solid var(--border-strong)':''}"><td>${esc(r[0])}</td><td class="mono align-right ${r[0]==='Net Profit / (Loss)'?(netProfit>=0?'text-success':'text-danger'):(r[0].includes('Less')?'text-danger':'')}"><strong>${r[1]}</strong></td></tr>`).join('') )}
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Net Profit')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Item'),t('Amount')], [
+        [t('Gross Profit'), money(grossProfit)],
+        [t('Less: Operating Expenses'), money(opExpenses)],
+        [t('Less: Direct Costs'), money(directCosts)],
+        [t('Net Profit / (Loss)'), money(netProfit)],
+        [t('Net Margin'), netMargin + '%']
+      ].map(r=>`<tr style="${r[0]===t('Net Profit / (Loss)')?'border-top:2px solid var(--border-strong)':''}"><td>${esc(r[0])}</td><td class="mono align-right ${r[0]===t('Net Profit / (Loss)')?(netProfit>=0?'text-success':'text-danger'):(r[0].includes(t('Less'))?'text-danger':'')}"><strong>${r[1]}</strong></td></tr>`).join('') )}
     </div></div>
   </div>
 </div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Filters</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Filters')}</h2></div><div class="card-body">
   <form id="pnlFilter" class="form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
     ${input('reportStartDate','From','date',startDate,'')}
     ${input('reportEndDate','To','date',endDate,'')}
@@ -1437,46 +1494,46 @@ function reports(){
     return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.reports[0]} - Daily Cash Report</h1><p class="page-subtitle">Cash flow statement - inflows and outflows ${dateRangeLabel}</p></div><div class="page-header-actions">
   <button class="btn btn-champagne" data-report-export-csv="cash">Export CSV</button>
-  <button class="btn btn-secondary" data-report-export-pdf="cash">Export PDF</button>
+  <button class="btn btn-secondary" data-report-export-pdf="cash">${t('Export PDF')}</button>
 </div></div></div>
 <div class="metric-grid">
-  ${card('Total Inflows', money(totalIn), `${allInflows.length} transactions`)}
-  ${card('Total Outflows', money(totalOut), `${allOutflows.length} transactions`)}
-  ${card('Net Cash Flow', money(netCash), netCash >= 0 ? 'Positive' : 'Negative')}
-  ${card('Cash Sales', money(cashInflows.filter(x=>x.method==='Cash').reduce((s,x)=>s+x.amount,0)), 'Physical cash received')}
+  ${card(t('Total Inflows'), money(totalIn), `${allInflows.length} ${t('transactions')}`)}
+  ${card(t('Total Outflows'), money(totalOut), `${allOutflows.length} ${t('transactions')}`)}
+  ${card(t('Net Cash Flow'), money(netCash), netCash >= 0 ? t('Positive') : t('Negative'))}
+  ${card(t('Cash Sales'), money(cashInflows.filter(x=>x.method==='Cash').reduce((s,x)=>s+x.amount,0)), t('Physical cash received'))}
 </div>
 <div class="layout">
   <div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Inflows by Method</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Method','Amount','Count'], Object.entries(inByMethod).map(([m,v])=>`<tr><td>${esc(m)}</td><td class="mono align-right">${money(v)}</td><td class="mono align-right">${allInflows.filter(x=>x.method===m).length}</td></tr>`).join('') || '<tr><td colspan="3" class="align-center">No inflows</td></tr>')}
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Inflows by Method')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Method'),t('Amount'),t('Count')], Object.entries(inByMethod).map(([m,v])=>`<tr><td>${esc(m)}</td><td class="mono align-right">${money(v)}</td><td class="mono align-right">${allInflows.filter(x=>x.method===m).length}</td></tr>`).join('') || `<tr><td colspan="3" class="align-center">${t('No inflows')}</td></tr>`)}
     </div></div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Outflows by Method</h2></div><div class="card-body" style="padding:0">
-      ${rows(['Method','Amount','Count'], Object.entries(outByMethod).map(([m,v])=>`<tr><td>${esc(m)}</td><td class="mono align-right">${money(v)}</td><td class="mono align-right">${allOutflows.filter(x=>x.method===m).length}</td></tr>`).join('') || '<tr><td colspan="3" class="align-center">No outflows</td></tr>')}
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Outflows by Method')}</h2></div><div class="card-body" style="padding:0">
+      ${rows([t('Method'),t('Amount'),t('Count')], Object.entries(outByMethod).map(([m,v])=>`<tr><td>${esc(m)}</td><td class="mono align-right">${money(v)}</td><td class="mono align-right">${allOutflows.filter(x=>x.method===m).length}</td></tr>`).join('') || `<tr><td colspan="3" class="align-center">${t('No outflows')}</td></tr>`)}
     </div></div>
   </div>
   <div>
-    <div class="card section"><div class="card-header"><h2 class="card-title">Daily Cash Summary</h2></div><div class="card-body" style="padding:0;max-height:400px;overflow:auto">
-      ${rows(['Date','Inflows','Outflows','Net'], Object.entries(byDate).sort((a,b)=>b[0].localeCompare(a[0])).map(([d,v])=>`<tr>
+    <div class="card section"><div class="card-header"><h2 class="card-title">${t('Daily Cash Summary')}</h2></div><div class="card-body" style="padding:0;max-height:400px;overflow:auto">
+      ${rows([t('Date'),t('Inflows'),t('Outflows'),t('Net')], Object.entries(byDate).sort((a,b)=>b[0].localeCompare(a[0])).map(([d,v])=>`<tr>
         <td class="mono">${fmtDate(d)}</td>
         <td class="mono align-right text-success">${money(v.in)}</td>
         <td class="mono align-right text-danger">${money(v.out)}</td>
         <td class="mono align-right ${rnd(v.in-v.out)>=0?'text-success':'text-danger'}"><strong>${money(rnd(v.in-v.out))}</strong></td>
-      </tr>`).join('') || '<tr><td colspan="4" class="align-center">No cash movements</td></tr>')}
+      </tr>`).join('') || `<tr><td colspan="4" class="align-center">${t('No cash movements')}</td></tr>`)}
     </div></div>
   </div>
 </div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Cash Inflow Detail</h2></div><div class="card-body" style="padding:0;max-height:300px;overflow:auto">
-  ${rows(['Date','Type','Ref','Party','Method','Amount'], allInflows.sort((a,b)=>new Date(b.date)-new Date(a.date)).map(x=>`<tr>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Cash Inflow Detail')}</h2></div><div class="card-body" style="padding:0;max-height:300px;overflow:auto">
+  ${rows([t('Date'),t('Type'),t('Ref'),t('Party'),t('Method'),t('Amount')], allInflows.sort((a,b)=>new Date(b.date)-new Date(a.date)).map(x=>`<tr>
     <td class="mono">${fmtDate(x.date)}</td>
     <td>${esc(x.type)}</td>
     <td><code class="mono">${esc(x.ref)}</code></td>
     <td>${esc(x.party)}</td>
     <td>${esc(x.method)}</td>
     <td class="mono align-right text-success">${money(x.amount)}</td>
-  </tr>`).join('') || '<tr><td colspan="6" class="align-center">No inflows</td></tr>')}
+  </tr>`).join('') || `<tr><td colspan="6" class="align-center">${t('No inflows')}</td></tr>`)}
 </div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Cash Outflow Detail</h2></div><div class="card-body" style="padding:0;max-height:300px;overflow:auto">
-  ${rows(['Date','Type','Ref','Party','Method','Amount'], allOutflows.sort((a,b)=>new Date(b.date)-new Date(a.date)).map(x=>`<tr>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Cash Outflow Detail')}</h2></div><div class="card-body" style="padding:0;max-height:300px;overflow:auto">
+  ${rows([t('Date'),t('Type'),t('Ref'),t('Party'),t('Method'),t('Amount')], allOutflows.sort((a,b)=>new Date(b.date)-new Date(a.date)).map(x=>`<tr>
     <td class="mono">${fmtDate(x.date)}</td>
     <td>${esc(x.type)}</td>
     <td><code class="mono">${esc(x.ref)}</code></td>
@@ -1485,7 +1542,7 @@ function reports(){
     <td class="mono align-right text-danger">${money(x.amount)}</td>
   </tr>`).join('') || '<tr><td colspan="6" class="align-center">No outflows</td></tr>')}
 </div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Filters</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Filters')}</h2></div><div class="card-body">
   <form id="cashFilter" class="form" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
     ${input('reportStartDate','From','date',startDate,'')}
     ${input('reportEndDate','To','date',endDate,'')}
@@ -1498,9 +1555,9 @@ function reports(){
   // Default - show report selector
   return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.reports[0]}</h1><p class="page-subtitle">${PAGE_TITLES.reports[1]}</p></div><div class="page-header-actions">
-  <button class="btn btn-outline-champagne" id="export">Export JSON Backup</button>
+  <button class="btn btn-outline-champagne" id="export">${t('Export JSON Backup')}</button>
 </div></div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Select Report</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Select Report')}</h2></div><div class="card-body">
   <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px">
     ${[
       {id:'sales',title:'Sales Report',desc:'Revenue, invoices, payment methods, metal breakdown'},
@@ -1516,7 +1573,7 @@ function reports(){
     ].map(r=>`<button class="btn btn-secondary" style="height:120px;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:16px" data-report-type="${r.id}"><strong style="font-size:1.1rem">${r.title}</strong><span class="small muted" style="margin-top:4px">${r.desc}</span></button>`).join('')}
   </div>
 </div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Quick Summary</h2></div><div class="card-body" style="padding:0">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Quick Summary')}</h2></div><div class="card-body" style="padding:0">
   ${(function(){
     const t=totals();
     const balances=getAllMetalBalances();
@@ -2252,27 +2309,27 @@ function settings(){
   const isAdmin = window.RatnaOS?.auth?.hasPermission('settings:backup');
   return `
 <div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.settings[0]}</h1><p class="page-subtitle">${PAGE_TITLES.settings[1]}</p></div></div></div>
-<div class="layout"><div><div class="card"><div class="card-header"><h2 class="card-title">Shop Settings</h2></div><div class="card-body"><form id="settings" class="form">${input('shop','Shop Name','text',state.settings.shop)}${select('language','Language',LANGUAGE_OPTIONS,state.settings.language||getLanguage())}${select('country','Country',COUNTRY_OPTIONS,state.settings.country||getCountry())}${input('currency','Currency Code','text',state.settings.currency)}${input('taxRate','Tax Rate %','number',state.settings.taxRate,'min="0" step="0.01"')}${input('taxLabel','Tax Label','text',state.settings.taxLabel||'VAT')}${select('weightUnit','Weight Unit',[{value:'gram',label:'Gram (g)'},{value:'tola',label:'Tola'},{value:'aana',label:'Aana'},{value:'ratti',label:'Ratti'}],state.settings.weightUnit||'gram')}${input('invoicePrefix','Invoice Prefix','text',state.settings.invoicePrefix||'INV')}<div class="field"><label class="field-label" for="taxInclusive">${t('Tax Inclusive Pricing')}</label><select class="field-select" id="taxInclusive" name="taxInclusive"><option value="yes" ${state.settings.taxInclusive?'selected':''}>${t('Yes')}</option><option value="no" ${state.settings.taxInclusive?'':'selected'}>${t('No')}</option></select></div>${input('dial','Country Dial Code','text',state.settings.dial||countryProfile().dial)}${input('vatNumber','VAT / PAN Number','text',state.settings.vatNumber||'')}${select('numeralStyle','Digits',[{value:'devanagari',label:'Devanagari (१२३)'},{value:'latin',label:'Latin (123)'}],state.settings.numeralStyle||'devanagari')}${select('calendar','Calendar',[{value:'bs',label:'Bikram Sambat (BS)'},{value:'ad',label:'Gregorian (AD)'},{value:'both',label:'BS + AD'}],state.settings.calendar||countryProfile().calendar||'ad')}<div class="field-full"><button class="btn btn-champagne" type="submit">${t('Save Settings')}</button></div></form></div></div>
+<div class="layout"><div><div class="card"><div class="card-header"><h2 class="card-title">${t('Shop Settings')}</h2></div><div class="card-body"><form id="settings" class="form">${input('shop',t('Shop Name'),'text',state.settings.shop)}${select('language',t('Language'),LANGUAGE_OPTIONS,state.settings.language||getLanguage())}${select('country',t('Country'),COUNTRY_OPTIONS,state.settings.country||getCountry())}${input('currency',t('Currency Code'),'text',state.settings.currency)}${input('taxRate',t('Tax Rate %'),'number',state.settings.taxRate,'min="0" step="0.01"')}${input('taxLabel',t('Tax Label'),'text',state.settings.taxLabel||'VAT')}${select('weightUnit',t('Weight Unit'),[{value:'gram',label:t('Gram (g)')},{value:'tola',label:t('Tola')},{value:'suki',label:t('Suki')},{value:'aana',label:t('Aana')},{value:'lal',label:t('Lal')},{value:'ratti',label:t('Ratti')}],state.settings.weightUnit||'gram')}${input('invoicePrefix',t('Invoice Prefix'),'text',state.settings.invoicePrefix||'INV')}<div class="field"><label class="field-label" for="taxInclusive">${t('Tax Inclusive Pricing')}</label><select class="field-select" id="taxInclusive" name="taxInclusive"><option value="yes" ${state.settings.taxInclusive?'selected':''}>${t('Yes')}</option><option value="no" ${state.settings.taxInclusive?'':'selected'}>${t('No')}</option></select></div>${input('dial',t('Country Dial Code'),'text',state.settings.dial||countryProfile().dial)}${input('vatNumber',t('VAT / PAN Number'),'text',state.settings.vatNumber||'')}${select('numeralStyle',t('Digits'),[{value:'devanagari',label:t('Devanagari (१२३)')},{value:'latin',label:t('Latin (123)')}],state.settings.numeralStyle||'devanagari')}${select('calendar',t('Calendar'),[{value:'bs',label:t('Bikram Sambat (BS)')},{value:'ad',label:t('Gregorian (AD)')},{value:'both',label:t('BS + AD')}],state.settings.calendar||countryProfile().calendar||'ad')}<div class="field-full"><button class="btn btn-champagne" type="submit">${t('Save Settings')}</button></div></form></div></div>
 ${regionalProfileCard()}
 ${rateSyncCard()}
 ${confirmationCard()}
 
 ${isAdmin ? `
-<div class="card section"><div class="card-header"><h2 class="card-title">Backup & Restore</h2></div><div class="card-body">
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Backup & Restore')}</h2></div><div class="card-body">
 <div class="detail-grid">
-<div><span class="muted">Auto-Backup</span><div><span class="badge badge-completed">Enabled (hourly)</span></div></div>
-<div><span class="muted">Max Backups</span><div class="mono">50</div></div>
-<div><span class="muted">Last Backup</span><div id="lastBackupTime" class="mono">Checking...</div></div>
+<div><span class="muted">${t('Auto-Backup')}</span><div><span class="badge badge-completed">${t('Enabled (hourly)')}</span></div></div>
+<div><span class="muted">${t('Max Backups')}</span><div class="mono">50</div></div>
+<div><span class="muted">${t('Last Backup')}</span><div id="lastBackupTime" class="mono">${t('Checking...')}</div></div>
 </div>
 <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap">
-<button class="btn btn-champagne" data-backup-create>Create Backup Now</button>
-<button class="btn btn-secondary" data-backup-list>View Backups</button>
-<button class="btn btn-outline-champagne" data-backup-export>Export All Backups</button>
+<button class="btn btn-champagne" data-backup-create>${t('Create Backup Now')}</button>
+<button class="btn btn-secondary" data-backup-list>${t('View Backups')}</button>
+<button class="btn btn-outline-champagne" data-backup-export>${t('Export All Backups')}</button>
 </div>
 <div id="backupListModal" style="display:none;margin-top:16px"></div>
 </div></div>
 ` : ''}
-<div><div class="card"><div class="card-header"><h2 class="card-title">About</h2></div><div class="card-body"><p style="font-family:'Playfair Display',serif;font-size:1.4rem;color:var(--gold-primary);margin:0 0 8px">RatnaOS</p><p class="muted">${t('Local-first pilot. Data stored in browser localStorage. Karigar/Production jobs record metal issue/return/wastage transactions that automatically update metal ledger balances.')}</p></div></div></div></div>`;
+<div><div class="card"><div class="card-header"><h2 class="card-title">${t('About')}</h2></div><div class="card-body"><p style="font-family:'Playfair Display',serif;font-size:1.4rem;color:var(--gold-primary);margin:0 0 8px">RatnaOS</p><p class="muted">${t('Local-first pilot. Data stored in browser localStorage. Karigar/Production jobs record metal issue/return/wastage transactions that automatically update metal ledger balances.')}</p></div></div></div></div>`;
 }
 
 // Backup Management Functions
@@ -2344,18 +2401,6 @@ function renderLoginPage() {
             <div id="loginError" class="login-error" style="display:none"></div>
             <button class="btn btn-champagne btn-block login-submit" type="submit">${icon('logout')}<span>${t('Sign In')}</span></button>
           </form>
-          <div class="login-demo">
-            <p class="small muted">${t('Demo Credentials')}</p>
-            <div class="demo-accounts">
-              <button type="button" class="demo-btn" data-user="admin" data-pass="admin123">${t('Admin')}</button>
-              <button type="button" class="demo-btn" data-user="manager" data-pass="manager123">${t('Manager')}</button>
-              <button type="button" class="demo-btn" data-user="sales" data-pass="sales123">${t('Sales')}</button>
-              <button type="button" class="demo-btn" data-user="production" data-pass="prod123">${t('Production')}</button>
-              <button type="button" class="demo-btn" data-user="accountant" data-pass="account123">${t('Accountant')}</button>
-              <button type="button" class="demo-btn" data-user="viewer" data-pass="viewer123">${t('Viewer')}</button>
-            </div>
-            <p class="small muted" style="margin-top:12px">${t('Click any button to auto-fill credentials')}</p>
-          </div>
         </div>
         <p class="login-footer">${t('Pilot Build')} · ${t('Local browser storage only')}</p>
       </div>
@@ -2373,12 +2418,12 @@ function renderLoginPage() {
     const password = form.password.value;
 
     try {
-      const result = window.RatnaOS.auth.login(username, password);
+      const result = await window.RatnaOS.auth.login(username, password);
       if (result.success) {
         if (result.mustChangePassword) {
           showChangePasswordModal(username);
         } else {
-          render();
+          render();;
         }
       } else {
         errorEl.textContent = result.error || 'Login failed';
@@ -2389,14 +2434,6 @@ function renderLoginPage() {
       errorEl.textContent = err.message;
       errorEl.style.display = 'block';
     }
-  });
-
-  // Demo account quick-fill buttons
-  document.querySelectorAll('.demo-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      form.username.value = btn.dataset.user;
-      form.password.value = btn.dataset.pass;
-    });
   });
 
   // Focus username field
@@ -2436,7 +2473,7 @@ function showChangePasswordModal(username) {
   `;
   document.body.appendChild(modal);
 
-  modal.querySelector('#changePassForm').addEventListener('submit', (e) => {
+  modal.querySelector('#changePassForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const form = e.target;
     const currentPass = form.currentPassword.value;
@@ -2455,11 +2492,11 @@ function showChangePasswordModal(username) {
       return;
     }
 
-    const result = window.RatnaOS.auth.changePassword(username, currentPass, newPass);
+    const result = await window.RatnaOS.auth.changePassword(username, currentPass, newPass);
     if (result.success) {
       modal.remove();
       window.RatnaOS.showNotification('Password updated successfully', 'success');
-      render();
+      render();;
     } else {
       errorEl.textContent = result.error || 'Failed to change password';
       errorEl.style.display = 'block';
@@ -2528,10 +2565,10 @@ function accountingOverview(){
   };
   const recent=[...state.accounting.journals].sort((a,b)=>(b.postedAt||'').localeCompare(a.postedAt||'')).slice(0,8);
   return `<div class="metric-grid">
-    ${card('Posted Journals', summary.journals, t('Double-entry'),'reports')}
-    ${card('Total Debits', acctMoney(summary.debit), t('Minor units exact'),'scale')}
-    ${card('Total Credits', acctMoney(summary.credit), t('Must match debits'),'scale')}
-    ${card('Ledger Difference', acctMoney(summary.difference), summary.balanced?t('Balanced'):t('Unbalanced'),'check')}
+    ${card(t('Posted Journals'), summary.journals, t('Double-entry'),'reports')}
+    ${card(t('Total Debits'), acctMoney(summary.debit), t('Minor units exact'),'scale')}
+    ${card(t('Total Credits'), acctMoney(summary.credit), t('Must match debits'),'scale')}
+    ${card(t('Ledger Difference'), acctMoney(summary.difference), summary.balanced?t('Balanced'):t('Unbalanced'),'check')}
   </div>
   <div class="card section"><div class="card-header"><h2 class="card-title">${esc(t('Accounting Posting'))}</h2>${summary.balanced?kcBadge(t('Balanced'),'badge-completed'):kcBadge(t('Unbalanced'),'badge-warn')}</div><div class="card-body">
     <p class="small muted">${esc(t('Existing sales, paid expenses and valued metal transactions are posted once. Duplicate sources are skipped.'))}</p>
@@ -2569,12 +2606,12 @@ function acctAccountOptions(selected){
 }
 function openVoucherModal(){
   const modal=document.createElement('div'); modal.className='modal-overlay';
-  const line=(d='',c='')=>`<div class="vch-line" style="display:grid;grid-template-columns:minmax(150px,2fr) minmax(80px,1fr) minmax(80px,1fr) minmax(110px,1.5fr) auto;gap:6px;margin-bottom:6px"><select class="field-select" name="vchAccount">${acctAccountOptions()}</select><input class="field-input" name="vchDebit" type="number" min="0" step="0.01" value="${d}" placeholder="Debit"><input class="field-input" name="vchCredit" type="number" min="0" step="0.01" value="${c}" placeholder="Credit"><input class="field-input" name="vchLineMemo" placeholder="Line memo"><button type="button" class="btn btn-ghost btn-sm" data-vch-del>×</button></div>`;
+  const line=(d='',c='')=>`<div class="vch-line" style="display:grid;grid-template-columns:minmax(150px,2fr) minmax(80px,1fr) minmax(80px,1fr) minmax(110px,1.5fr) auto;gap:6px;margin-bottom:6px"><select class="field-select" name="vchAccount">${acctAccountOptions()}</select><input class="field-input" name="vchDebit" type="number" min="0" step="0.01" value="${d}" placeholder="${t('Debit')}"><input class="field-input" name="vchCredit" type="number" min="0" step="0.01" value="${c}" placeholder="${t('Credit')}"><input class="field-input" name="vchLineMemo" placeholder="${t('Line memo')}"><button type="button" class="btn btn-ghost btn-sm" data-vch-del>×</button></div>`;
   modal.innerHTML=`<div class="modal" style="max-width:820px"><div class="modal-header"><h3 class="modal-title">${esc(t('New Voucher'))}</h3><button class="modal-close" data-close-modal>×</button></div><div class="modal-body">
     <div class="form" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px">
       <div class="field"><label class="field-label" for="vchType">${esc(t('Voucher type'))}</label><select class="field-select" id="vchType">${['Receipt','Payment','Journal','Contra'].map(x=>`<option value="${x}">${esc(t(x))}</option>`).join('')}</select></div>
       <div class="field"><label class="field-label" for="vchDate">${esc(t('Date'))}</label><input class="field-input" id="vchDate" type="date" value="${new Date().toISOString().slice(0,10)}"></div>
-      <div class="field"><label class="field-label" for="vchRef">${esc(t('Reference'))}</label><input class="field-input" id="vchRef" placeholder="Voucher / cheque no."></div>
+      <div class="field"><label class="field-label" for="vchRef">${esc(t('Reference'))}</label><input class="field-input" id="vchRef" placeholder="${esc(t('Voucher / cheque no.'))}"></div>
       <div class="field"><label class="field-label" for="vchMemo">${esc(t('Memo'))}</label><input class="field-input" id="vchMemo" placeholder="${esc(t('Description'))}"></div>
     </div>
     <div style="margin-top:12px" id="vchLines">${line()}${line()}</div>
@@ -2698,10 +2735,10 @@ function taxOverview(){
   const unverified=state.tax.rules.filter(r=>!r.verified);
   const openPeriods=state.tax.vatPeriods.filter(p=>p.status!=='paid');
   return `<div class="metric-grid">
-    ${card('VAT Payable',taxMoney(payable),t('Unpaid balance'),'reports')}
-    ${card('TDS Outstanding',taxMoney(summary.tdsOutstanding),t('Not yet deposited'),'scale')}
-    ${card('Unverified Rules',summary.unverified,t('Needs verification'),'alert')}
-    ${card('Output VAT',taxMoney(liability.output),t('All posted output VAT'),'reports')}
+    ${card(t('VAT Payable'),taxMoney(payable),t('Unpaid balance'),'reports')}
+    ${card(t('TDS Outstanding'),taxMoney(summary.tdsOutstanding),t('Not yet deposited'),'scale')}
+    ${card(t('Unverified Rules'),summary.unverified,t('Needs verification'),'alert')}
+    ${card(t('Output VAT'),taxMoney(liability.output),t('All posted output VAT'),'reports')}
   </div>
   <div class="card section"><div class="card-header"><h2 class="card-title">${esc(t('Compliance Status'))}</h2><span class="badge">v${state.tax.meta.version}</span></div><div class="card-body">
     <div class="detail-grid">
@@ -2772,7 +2809,7 @@ function taxTds(){
     <div class="field"><label class="field-label" for="taxTdsExpense">${esc(t('Expense account'))}</label><select class="field-select" id="taxTdsExpense">${taxAccountOptions(['expense'],'6900')}</select></div>
     <div class="field" style="align-self:end"><button type="button" class="btn btn-champagne" data-tax-tds-save>${icon('plus')}<span>${esc(t('Post TDS entry'))}</span></button></div>
   </div><p class="small muted" style="margin-top:8px">${esc(t('The rule rate for the selected category and date is applied unless you enter an amount.'))}</p></div></div>`:`<p class="note note-caution">${esc(t('Add a verified TDS rule before recording deductions.'))}</p>`;
-  return `<div class="metric-grid">${card('TDS Outstanding',taxMoney(tdsOutstanding(state)),t('Not yet deposited'),'scale')}${card('TDS Entries',list.length,t('Recorded deductions'),'reports')}</div>
+  return `<div class="metric-grid">${card(t('TDS Outstanding'),taxMoney(tdsOutstanding(state)),t('Not yet deposited'),'scale')}${card(t('TDS Entries'),list.length,t('Recorded deductions'),'reports')}</div>
   ${form}<div class="card section"><div class="card-header"><h2 class="card-title">${esc(t('TDS Register'))}</h2><span class="badge">${list.length}</span></div><div class="card-body" style="padding:0">${rows(['Date','Category','Recipient','PAN','Taxable','Rate','TDS','Status',''],body)}</div></div>
   <p class="note note-caution">${esc(t('Deposit deadlines and thresholds depend on current law. Confirm each category against IRD guidance.'))}</p>`;
 }
@@ -2846,10 +2883,10 @@ function taxWorkspace(){
   const tdsOpen=state.tax.tdsEntries.filter(e=>e.status!=='deposited');
   const overdue=state.tax.calendar.filter(e=>e.status==='overdue');
   return `<div class="metric-grid">
-    ${card('Open VAT Periods',openPeriods.length,t('Pending filing'),'reports')}
-    ${card('Unverified Rules',unverified.length,t('Needs verification'),'alert')}
-    ${card('Open TDS',tdsOpen.length,t('Not deposited'),'scale')}
-    ${card('Overdue Filings',overdue.length,t('Calendar'),'calendar')}
+    ${card(t('Open VAT Periods'),openPeriods.length,t('Pending filing'),'reports')}
+    ${card(t('Unverified Rules'),unverified.length,t('Needs verification'),'alert')}
+    ${card(t('Open TDS'),tdsOpen.length,t('Not deposited'),'scale')}
+    ${card(t('Overdue Filings'),overdue.length,t('Calendar'),'calendar')}
   </div>
   <div class="card section"><div class="card-header"><h2 class="card-title">${esc(t('CA Review Checklist'))}</h2></div><div class="card-body">
     <ul class="small">
@@ -3083,10 +3120,24 @@ ${kcUI.query?'':`<div class="tabs" style="margin:8px 0 16px;flex-wrap:wrap">${ta
 <p class="small muted" style="margin-top:8px">${esc(t('Master data for jewellery operations'))} · ${esc(t('Records flagged “Needs Verification” are reference values, not certified standards.'))}</p>`;
 }
 
+// Dynamic page module cache (populated by preloadPageModules at module level)
+const pageModuleCache = {};
+
+function loadPageModule(pageName) {
+  return pageModules[pageName] || null;
+}
+
 function render() {
+  // Preserve focus & caret across the full innerHTML rebuild so typing in
+  // search fields doesn't lose focus or make the page flicker.
+  const activeEl = document.activeElement;
+  const focusId = activeEl && activeEl.id && document.getElementById(activeEl.id) === activeEl ? activeEl.id : null;
+  let caretStart = null, caretEnd = null;
+  if (focusId) { try { caretStart = activeEl.selectionStart; caretEnd = activeEl.selectionEnd; } catch (_) {} }
+  const scrollTop = window.scrollY;
+
   ensureAccounting(state);
   ensureTax(state);
-ensureTax(state);
   // Check authentication
   if (!window.RatnaOS?.auth?.isAuthenticated()) {
     renderLoginPage();
@@ -3098,24 +3149,67 @@ ensureTax(state);
   if (!allowedTabs.includes(tab)) {
     tab = allowedTabs[0] || 'dashboard';
   }
-  const pageFn={dashboard,inventory,pos,metals,exchange,karigar,production,reports,accounting,tax,knowledge,settings}[tab]||dashboard;
+
+  // Restore POS draft into state once per POS entry
+  if (tab === 'pos') {
+    if (!render.__posDraftLoaded) { loadPOSDraftIntoState(); render.__posDraftLoaded = true; }
+  } else {
+    render.__posDraftLoaded = false;
+  }
+
+  // Load page module from pre-loaded cache (synchronous)
+  let pageHtml = '';
+  try {
+    if (tab === 'accounting') {
+      pageHtml = accounting();
+    } else if (tab === 'tax') {
+      pageHtml = tax();
+    } else {
+      const pageFn = loadPageModule(tab) || (() => `<div class="card"><div class="card-body">${t('Page not available')}</div></div>`);
+      pageHtml = pageFn();
+    }
+  } catch (e) {
+    console.error(`[render] Page module error for tab '${tab}':`, e);
+    pageHtml = `<div class="card"><div class="card-body">${t('Page error')}: ${esc(String(e.message||e))}</div></div>`;
+  }
+
   document.querySelector('#app').innerHTML=`
 <div class="app">
-  <aside class="sidebar ${sidebarOpen?'open':''}" id="sidebar" role="navigation" aria-label="Main navigation">
-    <div class="sidebar-header"><div class="sidebar-logo">${icon('gem')}</div><span class="sidebar-title">RatnaOS</span></div>
+  <div class="sidebar-backdrop ${sidebarOpen?'show':''}" id="sidebarBackdrop" aria-hidden="true"></div>
+  <aside class="sidebar ${sidebarOpen?'open':''}" id="sidebar" role="navigation" aria-label="${esc(t('Main navigation'))}">
+    <div class="sidebar-header"><div class="sidebar-logo">${icon('gem')}</div><span class="sidebar-title">RatnaOS</span><button class="sidebar-close" id="sidebarClose" aria-label="${esc(t('Close menu'))}">${icon('close')}</button></div>
     <nav class="sidebar-nav">${allowedTabs.map(k=>`<button class="nav-item ${tab===k?'active':''}" data-tab="${k}" title="${PAGE_TITLES[k][0]}">${NAV_ICONS[k]}<span class="nav-label">${PAGE_TITLES[k][0]}</span></button>`).join('')}</nav>
     <div class="sidebar-footer"><div class="sidebar-version">v0.1.0</div></div>
   </aside>
-  <header class="header" role="banner"><div class="header-left"><button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar" aria-expanded="${sidebarOpen}">${icon('menu')}</button><div><h1 class="page-title">${PAGE_TITLES[tab]?PAGE_TITLES[tab][0]:tab}</h1><p class="page-subtitle">${PAGE_TITLES[tab]?PAGE_TITLES[tab][1]:''}</p></div></div><div class="header-right" style="display:flex;align-items:center;gap:12px"><div class="header-actions"><div class="lang-switch" role="group" aria-label="${esc(t('Language'))}">${[['en','EN'],['ne','ने'],['hi','हि']].map(([code,label])=>`<button type="button" class="lang-btn ${getLanguage()===code?'active':''}" data-lang-set="${code}" title="${esc(LOCALES[code]?.native||label)}" aria-pressed="${getLanguage()===code?'true':'false'}">${label}</button>`).join('')}</div><button class="icon-btn tooltip" data-tab="inventory" data-tooltip="Search inventory" aria-label="Search inventory">${icon('search')}</button><button class="icon-btn tooltip" data-tab="production" data-tooltip="Notifications" aria-label="Notifications">${icon('bell')}</button></div><div class="user-info" style="display:flex;align-items:center;gap:8px"><span class="small muted">${esc(currentUser?.name||'User')}</span><span class="badge" style="font-size:var(--fs-2xs)">${esc(t(currentUser?.role||''))}</span></div><button class="btn btn-ghost btn-sm" data-auth-logout>${icon('logout')}<span>${t('Logout')}</span></button><button class="btn btn-champagne" data-tab="inventory">${icon('plus')}<span>${t('Add')}</span></button></div></header>
+  <header class="header" role="banner"><div class="header-left"><button class="sidebar-toggle" id="sidebarToggle" aria-label="${esc(t('Toggle sidebar'))}" aria-expanded="${sidebarOpen}">${icon('menu')}</button><div class="header-emblem" aria-hidden="true">${icon('gem')}</div><div><h1 class="page-title">${PAGE_TITLES[tab]?PAGE_TITLES[tab][0]:tab}</h1><p class="page-subtitle">${PAGE_TITLES[tab]?PAGE_TITLES[tab][1]:''}</p></div></div><div class="header-right"><div class="header-actions"><div class="lang-switch" role="group" aria-label="${esc(t('Language'))}">${[['en','EN'],['ne','ने'],['hi','हि']].map(([code,label])=>`<button type="button" class="lang-btn ${getLanguage()===code?'active':''}" data-lang-set="${code}" title="${esc(LOCALES[code]?.native||label)}" aria-pressed="${getLanguage()===code?'true':'false'}">${label}</button>`).join('')}</div><button class="icon-btn tooltip" data-tab="inventory" data-tooltip="${esc(t('Search inventory'))}" aria-label="${esc(t('Search inventory'))}">${icon('search')}</button><button class="icon-btn tooltip" data-tab="production" data-tooltip="${esc(t('Notifications'))}" aria-label="${esc(t('Notifications'))}">${icon('bell')}</button></div><div class="user-info"><span class="small muted">${esc(currentUser?.name||'User')}</span><span class="badge" style="font-size:var(--fs-2xs)">${esc(t(currentUser?.role||''))}</span></div><button class="btn btn-ghost btn-sm" data-auth-logout>${icon('logout')}<span>${t('Logout')}</span></button><button class="btn btn-champagne" data-tab="inventory">${icon('plus')}<span>${t('Add')}</span></button></div></header>
   <main class="main" id="mainContent" role="main">
 
-    ${pageFn()}
+    ${pageHtml}
   </main>
 </div>`;
   document.title=`${PAGE_TITLES[tab]?PAGE_TITLES[tab][0]:tab} · RatnaOS`;
   localizeDom(document.querySelector('#app'));
   bindDynamicUI();
+
+  // Restore saved form drafts once per view change (not on every keystroke render)
+  const draftViewKey = [tab, state.productionView || '', state.productionViewId || '', state.karigarView || '', state.karigarEditId || '', state.karigarSelectedJobId || ''].join('|');
+  if (render.__draftKey !== draftViewKey) { render.__draftKey = draftViewKey; restoreDraftsIn(document.getElementById('app')); }
+  if (tab === 'pos') { restorePOSDraftDOM(); refreshPOSUI(); }
+  if (tab === 'metals') { updateMetalTxnPreview(); updateExchangePreview(); }
+  else if (tab === 'exchange') { updateExchangePreview(); }
+
+  // Restore focus & caret to the same control after the rebuild.
+  if (focusId) {
+    const restored = document.getElementById(focusId);
+    if (restored) {
+      restored.focus({ preventScroll: true });
+      if (caretStart != null) { try { restored.setSelectionRange(caretStart, caretEnd); } catch (_) {} }
+    }
+  }
+  if (focusId && scrollTop) window.scrollTo(0, scrollTop);
 }
+
+window.RatnaOS.render = render;
 
 function karigar(){
   const karigars=state.karigars||[];
@@ -3154,7 +3248,7 @@ function karigar(){
   const kDetail=selK?(()=>{
     updateKarigarStats(selK.id);
     const kJobs=getKarigarJobs(selK.id).map(j=>{ensureJobShape(j);recalcJobFinancials(j);return j;});
-    return `<div class="card section"><div class="card-header"><h2 class="card-title">Karigar Profile: ${esc(selK.name)}</h2><div class="page-header-actions"><button class="btn btn-secondary btn-sm" data-k-edit="${esc(selK.id)}">Edit Profile</button></div></div><div class="card-body"><div class="detail-grid"><div><span class="muted">Phone</span><div>${esc(selK.phone||'-')}</div></div><div><span class="muted">Address</span><div>${esc(selK.address||'-')}</div></div><div><span class="muted">Specialties</span><div>${esc((selK.specialties||[]).join(', ')||'-')}</div></div><div><span class="muted">Status</span><div><span class="badge ${selK.status==='active'?'badge-completed':'badge-warn'}">${esc(selK.status||'active')}</span></div></div><div><span class="muted">Rate / Gram</span><div class="mono">${money(num(selK.ratePerGram))}</div></div><div><span class="muted">Rate / Tola</span><div class="mono">${money(num(selK.ratePerTola))}</div></div><div><span class="muted">Issued</span><div class="mono">${num(selK.totalWeightIssued||0).toFixed(3)} g</div></div><div><span class="muted">Returned</span><div class="mono">${num(selK.totalWeightReturned||0).toFixed(3)} g</div></div><div><span class="muted">Wastage</span><div class="mono">${num(selK.totalWastage||0).toFixed(3)} g</div></div><div><span class="muted">Labour Earned</span><div class="mono">${money(num(selK.totalLabourEarned||0))}</div></div></div><h4 style="margin-top:20px">Assigned Jobs</h4>${rows(['Job','Description','Status','Deadline','Issued','Returned','Labour'],kJobs.map(j=>`<tr><td><code class="mono">${esc(j.code)}</code></td><td>${esc(j.description||'')}</td><td>${jobStatusBadge(j.status)}</td><td class="mono">${esc(j.deadline||j.due||'-')}</td><td class="mono align-right">${getJobIssuedWeight(j).toFixed(3)}</td><td class="mono align-right">${getJobReturnedWeight(j).toFixed(3)}</td><td class="mono align-right">${money(num(j.labourCharges?.total||0))}</td></tr>`).join(''))}</div></div>`;
+    return `<div class="card section"><div class="card-header"><h2 class="card-title">${t('Karigar Profile')}: ${esc(selK.name)}</h2><div class="page-header-actions"><button class="btn btn-secondary btn-sm" data-k-edit="${esc(selK.id)}">${t('Edit Profile')}</button></div></div><div class="card-body"><div class="detail-grid"><div><span class="muted">${t('Phone')}</span><div>${esc(selK.phone||'-')}</div></div><div><span class="muted">${t('Address')}</span><div>${esc(selK.address||'-')}</div></div><div><span class="muted">${t('Specialties')}</span><div>${esc((selK.specialties||[]).join(', ')||'-')}</div></div><div><span class="muted">${t('Status')}</span><div><span class="badge ${selK.status==='active'?'badge-completed':'badge-warn'}">${esc(t(selK.status||'active'))}</span></div></div><div><span class="muted">${t('Rate / Gram')}</span><div class="mono">${money(num(selK.ratePerGram))}</div></div><div><span class="muted">${t('Rate / Tola')}</span><div class="mono">${money(num(selK.ratePerTola))}</div></div><div><span class="muted">${t('Issued')}</span><div class="mono">${num(selK.totalWeightIssued||0).toFixed(3)} g</div></div><div><span class="muted">${t('Returned')}</span><div class="mono">${num(selK.totalWeightReturned||0).toFixed(3)} g</div></div><div><span class="muted">${t('Wastage')}</span><div class="mono">${num(selK.totalWastage||0).toFixed(3)} g</div></div><div><span class="muted">${t('Labour Earned')}</span><div class="mono">${money(num(selK.totalLabourEarned||0))}</div></div></div><h4 style="margin-top:20px">${t('Assigned Jobs')}</h4>${rows([t('Job'),t('Description'),t('Status'),t('Deadline'),t('Issued'),t('Returned'),t('Labour')],kJobs.map(j=>`<tr><td><code class="mono">${esc(j.code)}</code></td><td>${esc(j.description||'')}</td><td>${jobStatusBadge(j.status)}</td><td class="mono">${esc(j.deadline||j.due||'-')}</td><td class="mono align-right">${getJobIssuedWeight(j).toFixed(3)}</td><td class="mono align-right">${getJobReturnedWeight(j).toFixed(3)}</td><td class="mono align-right">${money(num(j.labourCharges?.total||0))}</td></tr>`).join(''))}</div></div>`;
   })():'';
 
   const jobDetail=selJ?(()=>{
@@ -3190,14 +3284,14 @@ function karigar(){
   })():'';
 
   return `
-<div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.karigar[0]}</h1><p class="page-subtitle">${PAGE_TITLES.karigar[1]}</p></div><div class="page-header-actions"><button class="btn btn-secondary" data-k-new>New Karigar</button></div></div></div>
-<div class="metric-grid">${JOB_STATUSES.map(s=>card(t(s),statusCounts[s]||0,t('Jobs'))).join('')}${card('Karigars',karigars.length,t('Profiles'))}</div>
+<div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.karigar[0]}</h1><p class="page-subtitle">${PAGE_TITLES.karigar[1]}</p></div><div class="page-header-actions"><button class="btn btn-secondary" data-k-new>${t('New Karigar')}</button></div></div></div>
+<div class="metric-grid">${JOB_STATUSES.map(s=>card(t(s),statusCounts[s]||0,t('Jobs'))).join('')}${card(t('Karigars'),karigars.length,t('Profiles'))}</div>
 <div class="layout"><div>
-  <div class="card"><div class="card-header"><h2 class="card-title">${kEdit?'Edit Karigar Profile':'Add Karigar Profile'}</h2></div><div class="card-body"><form id="karigarForm" class="form" data-edit-id="${esc(kEditId)}">${input('name','Karigar / Workshop Name','text',kEdit?.name||'','')}${input('phone','Phone','text',kEdit?.phone||'','')}${input('address','Address','text',kEdit?.address||'','')}${select('status','Status',['active','inactive'],kEdit?.status||'active')}${input('ratePerGram','Rate per Gram (NPR)','number',num(kEdit?.ratePerGram||0),'min="0" step="0.01"')}${input('ratePerTola','Rate per Tola (NPR)','number',num(kEdit?.ratePerTola||0),'min="0" step="0.01"')}<div class="field field-full"><label class="field-label">Specialties</label><input class="field-input" name="specialties" value="${esc((kEdit?.specialties||[]).join(', '))}" placeholder="Casting, Filing, Polishing, Stone Setting"></div><div class="field-full" style="display:flex;gap:8px"><button class="btn btn-champagne" type="submit">${kEdit?'Update Profile':'Save Profile'}</button>${kEdit?'<button class="btn btn-ghost" type="button" data-k-cancel-edit>Cancel</button>':''}</div></form></div></div>
-  <div class="card section"><div class="card-header"><h2 class="card-title">Create Job Assignment</h2></div><div class="card-body"><form id="jobCreateForm" class="form">${input('code','Job Code','text',generateJobNumber(),'')}${input('description','Work Description','text','','')}<div class="field"><label class="field-label">Karigar</label><select class="field-select" name="assignedKarigarId"><option value="">Unassigned</option>${karigars.map(k=>`<option value="${esc(k.id)}">${esc(k.name)}</option>`).join('')}</select></div>${select('priority','Priority',PRIORITY_OPTIONS,'normal')}${input('deadline','Deadline','date','','')}${select('metalType','Metal',['Gold','Silver','Platinum'],'Gold')}${input('purity','Purity','text','22K','')}${input('wastageAllowed','Wastage Allowed (g)','number','0','min="0" step="0.001"')}${select('labourMethod','Labour Method',LABOUR_METHODS,'perGram')}${input('labourRate','Labour Rate','number','0','min="0" step="0.01"')}<div class="field-full">${input('notes','Notes','text','','')}</div><div class="field-full"><button class="btn btn-champagne" type="submit">Create Job</button></div></form><p class="note note-caution" style="margin-top:12px">Metal issues/returns record ledger transactions and automatically update metal balances.</p></div></div>
+  <div class="card"><div class="card-header"><h2 class="card-title">${kEdit?t('Edit Karigar Profile'):t('Add Karigar Profile')}</h2></div><div class="card-body"><form id="karigarForm" class="form" data-edit-id="${esc(kEditId)}">${input('name',t('Karigar / Workshop Name'),'text',kEdit?.name||'','')}${input('phone',t('Phone'),'text',kEdit?.phone||'','')}${input('address',t('Address'),'text',kEdit?.address||'','')}${select('status',t('Status'),['active','inactive'],kEdit?.status||'active')}${input('ratePerGram',t('Rate per Gram (NPR)'),'number',num(kEdit?.ratePerGram||0),'min="0" step="0.01"')}${input('ratePerTola',t('Rate per Tola (NPR)'),'number',num(kEdit?.ratePerTola||0),'min="0" step="0.01"')}<div class="field field-full"><label class="field-label">${t('Specialties')}</label><input class="field-input" name="specialties" value="${esc((kEdit?.specialties||[]).join(', '))}" placeholder="Casting, Filing, Polishing, Stone Setting"></div><div class="field-full" style="display:flex;gap:8px"><button class="btn btn-champagne" type="submit">${kEdit?t('Update Profile'):t('Save Profile')}</button>${kEdit?`<button class="btn btn-ghost" type="button" data-k-cancel-edit>${t('Cancel')}</button>`:''}</div></form></div></div>
+  <div class="card section"><div class="card-header"><h2 class="card-title">${t('Create Job Assignment')}</h2></div><div class="card-body"><form id="jobCreateForm" class="form">${input('code',t('Job Code'),'text',generateJobNumber(),'')}${input('description',t('Work Description'),'text','','')}<div class="field"><label class="field-label">${t('Karigar')}</label><select class="field-select" name="assignedKarigarId"><option value="">${t('Unassigned')}</option>${karigars.map(k=>`<option value="${esc(k.id)}">${esc(k.name)}</option>`).join('')}</select></div>${select('priority',t('Priority'),PRIORITY_OPTIONS,'normal')}${input('deadline',t('Deadline'),'date','','')}${select('metalType',t('Metal'),['Gold','Silver','Platinum'],'Gold')}${input('purity',t('Purity'),'text','22K','')}${input('wastageAllowed',t('Wastage Allowed (g)'),'number','0','min="0" step="0.001"')}${select('labourMethod',t('Labour Method'),LABOUR_METHODS,'perGram')}${input('labourRate',t('Labour Rate'),'number','0','min="0" step="0.01"')}<div class="field-full">${input('notes',t('Notes'),'text','','')}</div><div class="field-full"><button class="btn btn-champagne" type="submit">${t('Create Job')}</button></div></form><p class="note note-caution" style="margin-top:12px">${t('Metal issues/returns record ledger transactions and automatically update metal balances.')}</p></div></div>
 </div><div>
-  <div class="card"><div class="card-header"><h2 class="card-title">Karigar Profiles</h2></div><div class="card-body" style="padding:0">${rows(['Karigar','Specialties','Rate','Active','Done','Wastage','Labour','Action'],kProfileRows)}</div></div>
-  <div class="card section"><div class="card-header"><h2 class="card-title">Job Assignments</h2></div><div class="card-body"><div class="toolbar" style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap"><input type="search" id="karigarJobSearch" class="field-input" placeholder="Search jobs..." value="${esc(state.karigarJobSearch||'')}" style="max-width:260px"><select class="field-select" id="karigarJobFilterStatus" style="width:auto;min-width:150px">${['all',...JOB_STATUSES].map(s=>`<option value="${s}" ${filterStatus===s?'selected':''}>${s==='all'?'All Status':s}</option>`).join('')}</select><select class="field-select" id="karigarJobFilterKarigar" style="width:auto;min-width:170px"><option value="all">All Karigars</option>${karigars.map(k=>`<option value="${esc(k.id)}" ${filterK===k.id?'selected':''}>${esc(k.name)}</option>`).join('')}</select></div>${rows(['Code','Description','Karigar','Status','Deadline','Issued','Returned','Labour',''],jobRows)}</div></div>
+  <div class="card"><div class="card-header"><h2 class="card-title">${t('Karigar Profiles')}</h2></div><div class="card-body" style="padding:0">${rows([t('Karigar'),t('Specialties'),t('Rate'),t('Active'),t('Done'),t('Wastage'),t('Labour'),t('Action')],kProfileRows)}</div></div>
+  <div class="card section"><div class="card-header"><h2 class="card-title">${t('Job Assignments')}</h2></div><div class="card-body"><div class="toolbar" style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap"><input type="search" id="karigarJobSearch" class="field-input" placeholder="${t('Search jobs...')}" value="${esc(state.karigarJobSearch||'')}" style="max-width:260px"><select class="field-select" id="karigarJobFilterStatus" style="width:auto;min-width:150px">${['all',...JOB_STATUSES].map(s=>`<option value="${s}" ${filterStatus===s?'selected':''}>${s==='all'?t('All Status'):t(s)}</option>`).join('')}</select><select class="field-select" id="karigarJobFilterKarigar" style="width:auto;min-width:170px"><option value="all">${t('All Karigars')}</option>${karigars.map(k=>`<option value="${esc(k.id)}" ${filterK===k.id?'selected':''}>${esc(k.name)}</option>`).join('')}</select></div>${rows([t('Code'),t('Description'),t('Karigar'),t('Status'),t('Deadline'),t('Issued'),t('Returned'),t('Labour'),''],jobRows)}</div></div>
 </div></div>
 ${kDetail}
 ${jobDetail}`;
@@ -3261,33 +3355,33 @@ function production(){
   const allIssues=[]; jobs.forEach(j=>{(j.metalIssues||[]).forEach(m=>allIssues.push({...m,jobCode:j.code,karigar:m.karigar||j.assignedKarigarName||j.karigar||''}));});
   const allReturns=[]; jobs.forEach(j=>{(j.materialReturns||[]).forEach(r=>allReturns.push({...r,jobCode:j.code,karigar:r.karigar||j.assignedKarigarName||j.karigar||''}));});
 
-  const bomTable=boms.map((b)=>{const c=calcBom(b);return `<tr><td><code class="mono">${esc(b.code)}</code></td><td>${esc(b.name)}</td><td class="mono">${c.netWeight.toFixed(3)}g</td><td class="align-right mono">${money(c.metalCost)}</td><td class="align-right mono">${money(c.wastage)}</td><td class="align-right mono">${money(c.makingCost)}</td><td class="align-right mono">${money(c.stoneCost)}</td><td class="align-right mono"><strong>${money(c.total)}</strong></td><td class="align-center"><button class="btn btn-ghost btn-sm" data-bomview="${esc(b.id)}" title="View details"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></td></tr>`;}).join('');
+  const bomTable=boms.map((b)=>{const c=calcBom(b);return `<tr><td><code class="mono">${esc(b.code)}</code></td><td>${esc(b.name)}</td><td class="mono">${c.netWeight.toFixed(3)}g</td><td class="align-right mono">${money(c.metalCost)}</td><td class="align-right mono">${money(c.wastage)}</td><td class="align-right mono">${money(c.makingCost)}</td><td class="align-right mono">${money(c.stoneCost)}</td><td class="align-right mono"><strong>${money(c.total)}</strong></td><td class="align-center"><button class="btn btn-ghost btn-sm" data-bomview="${esc(b.id)}" title="${t('View details')}">${icon('eye')}</button></td></tr>`;}).join('');
 
   function renderCostCard(b){
     const c=calcBom(b);
     const pct=(k)=>c.total?((c.breakdown[k]/c.total)*100).toFixed(1):0;
-    return `<div class="card section"><div class="card-header"><h2 class="card-title">Cost Summary: ${esc(b.code)} - ${esc(b.name)}</h2></div><div class="card-body"><div class="metric-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:24px">${card('Total Production Cost',money(c.total))}${card('Cost per Gram',money(c.netWeight?c.total/c.netWeight:0))}${card('Net Metal Weight',c.netWeight.toFixed(3)+' g')}${card('Wastage (Jarti)',c.wastageWt.toFixed(3)+' g')}</div><div class="breakdown"><div class="breakdown-title">Cost Breakdown</div><div class="breakdown-bars">${Object.entries(c.breakdown).map(([k,v])=>`<div class="breakdown-row"><span class="breakdown-label">${k.charAt(0).toUpperCase()+k.slice(1)}</span><div class="breakdown-bar"><div class="breakdown-fill" style="width:${pct(k)}%"></div></div><span class="breakdown-value">${money(v)} (${pct(k)}%)</span></div>`).join('')}</div></div><div class="section"><div class="breakdown-title">Pricing & Margin Simulator</div><form id="pricing" class="form" data-bom="${esc(b.id)}" style="margin-top:12px">${input('markup','Target Markup %','number','25','min="0" step="0.1"')}<div class="field-full"><button class="btn btn-gold" type="submit" style="width:100%">Calculate Selling Price</button></div></form><p class="muted" id="priceResult" style="margin-top:12px;min-height:60px"></p></div><div class="section"><div class="breakdown-title">Export</div><div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px"><button class="btn btn-outline-gold" data-bomcsv="${esc(b.id)}">Job Card (CSV)</button><button class="btn btn-outline-gold" data-bompdf="${esc(b.id)}">Cost Sheet (CSV)</button></div></div></div></div>`;
+    return `<div class="card section"><div class="card-header"><h2 class="card-title">${t('Cost Summary')}: ${esc(b.code)} - ${esc(b.name)}</h2></div><div class="card-body"><div class="metric-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:24px">${card(t('Total Production Cost'),money(c.total))}${card(t('Cost per Gram'),money(c.netWeight?c.total/c.netWeight:0))}${card(t('Net Metal Weight'),c.netWeight.toFixed(3)+' g')}${card(t('Wastage (Jarti)'),c.wastageWt.toFixed(3)+' g')}</div><div class="breakdown"><div class="breakdown-title">${t('Cost Breakdown')}</div><div class="breakdown-bars">${Object.entries(c.breakdown).map(([k,v])=>`<div class="breakdown-row"><span class="breakdown-label">${k.charAt(0).toUpperCase()+k.slice(1)}</span><div class="breakdown-bar"><div class="breakdown-fill" style="width:${pct(k)}%"></div></div><span class="breakdown-value">${money(v)} (${pct(k)}%)</span></div>`).join('')}</div></div><div class="section"><div class="breakdown-title">${t('Pricing & Margin Simulator')}</div><form id="pricing" class="form" data-bom="${esc(b.id)}" style="margin-top:12px">${input('markup',t('Target Markup %'),'number','25','min="0" step="0.1"')}<div class="field-full"><button class="btn btn-champagne" type="submit" style="width:100%">${t('Calculate Selling Price')}</button></div></form><p class="muted" id="priceResult" style="margin-top:12px;min-height:60px"></p></div><div class="section"><div class="breakdown-title">${t('Export')}</div><div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px"><button class="btn btn-outline-champagne" data-bomcsv="${esc(b.id)}">${t('Job Card (CSV)')}</button><button class="btn btn-outline-champagne" data-bompdf="${esc(b.id)}">${t('Cost Sheet (CSV)')}</button></div></div></div></div>`;
   }
 
   return `
-<div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.production[0]}</h1><p class="page-subtitle">${PAGE_TITLES.production[1]}</p></div><div class="page-header-actions"><button class="btn btn-champagne" data-tab="karigar">Manage Jobs & Karigars</button></div></div></div>
-<div class="metric-grid">${JOB_STATUSES.map(s=>card(t(s), jobs.filter(j=>j.status===s).length, t('Production jobs'))).join('')}${card('Total Issued (g)', rnd(jobs.reduce((s,j)=>s+getJobIssuedWeight(j),0)).toFixed(3), t('Across jobs'))}${card('Total Wastage (g)', rnd(jobs.reduce((s,j)=>s+num(j.wastageActual),0)).toFixed(3), t('Actual'))}</div>
-<div class="card"><div class="card-header"><h2 class="card-title">Production Stages Pipeline</h2></div><div class="card-body"><div class="kanban">${stageColumns}</div><p class="note note-caution" style="margin-top:12px">${t('Open a job in Karigar & Jobs to update stages, photographs, quality checks, vouchers and charges. Metal issues/returns automatically update metal balances.')}</p></div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Production Jobs & Material Flow</h2></div><div class="card-body" style="padding:0">${rows(['Job','Description','Karigar','Status','Deadline','Issued (g)','Returned (g)','Wastage (g)','Labour','Action'],jobsRows)}</div></div>
-<div class="layout-2col section"><div class="card"><div class="card-header"><h2 class="card-title">Metal Issue Vouchers</h2></div><div class="card-body" style="padding:0">${rows(['Date','Job','Karigar','Voucher','Metal','Weight (g)','Notes'], allIssues.sort((a,b)=>(b.date||'').localeCompare(a.date||'')).map(m=>`<tr><td class="mono">${esc(m.date||'')}</td><td><code class="mono">${esc(m.jobCode||'-')}</code></td><td>${esc(m.karigar||'-')}</td><td><code class="mono">${esc(m.voucher||'-')}</code></td><td>${esc(m.metal||'')} ${esc(m.purity||'')}</td><td class="mono align-right">${num(m.weight).toFixed(3)}</td><td>${esc(m.notes||'')}</td></tr>`).join(''))}</div></div><div class="card"><div class="card-header"><h2 class="card-title">Material Returns & Wastage</h2></div><div class="card-body" style="padding:0">${rows(['Date','Job','Karigar','Voucher','Type','Metal','Weight (g)','Notes'], allReturns.sort((a,b)=>(b.date||'').localeCompare(a.date||'')).map(r=>`<tr><td class="mono">${esc(r.date||'')}</td><td><code class="mono">${esc(r.jobCode||'-')}</code></td><td>${esc(r.karigar||'-')}</td><td><code class="mono">${esc(r.voucher||'-')}</code></td><td><span class="badge ${r.type==='WASTAGE'?'badge-warn':'badge-completed'}">${esc(r.type||'RETURN')}</span></td><td>${esc(r.metal||'')} ${esc(r.purity||'')}</td><td class="mono align-right">${num(r.weight).toFixed(3)}</td><td>${esc(r.notes||'')}</td></tr>`).join(''))}</div></div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Raw Materials Master</h2></div><div class="card-body"><div class="tabs" style="margin-bottom:20px"><button class="tab active" data-mat-tab="metals">Precious Metals</button><button class="tab" data-mat-tab="gemstones">Gemstones & Diamonds</button><button class="tab" data-mat-tab="consumables">Consumables</button></div>
-<div id="mat-metals" class="mat-tab-panel"><form id="matMetal" class="form">${select('purity','Purity',metalPurities)}${input('rate','Rate per gram (NPR)','number','','min="0" step="0.01"')}${input('stock','Stock (g)','number','','min="0" step="0.001"')}<div class="field-full"><button class="btn btn-champagne" type="submit" style="width:100%">Add/Update Metal</button></div></form><div style="margin-top:24px">${rows(['Purity','Rate/g','Stock (g)'],mMetals.map(m=>`<tr><td>${esc(m.purity)}</td><td class="align-right mono">${money(num(m.rate))}</td><td class="align-right mono">${num(m.stock).toFixed(3)}</td></tr>`).join(''))}</div></div>
-<div id="mat-gemstones" class="mat-tab-panel" style="display:none"><form id="matStone" class="form">${select('type','Stone Type',stoneTypes)}${input('rate','Rate per carat (NPR)','number','','min="0" step="0.01"')}${input('stock','Stock (carat)','number','','min="0" step="0.01"')}${input('cert','Certification')}<div class="field-full"><button class="btn btn-champagne" type="submit" style="width:100%">Add/Update Stone</button></div></form><div style="margin-top:24px">${rows(['Type','Rate/ct','Stock (ct)','Cert'],mStones.map(s=>`<tr><td>${esc(s.type)}</td><td class="align-right mono">${money(num(s.rate))}</td><td class="align-right mono">${num(s.stock).toFixed(2)}</td><td>${esc(s.cert||'-')}</td></tr>`).join(''))}</div></div>
-<div id="mat-consumables" class="mat-tab-panel" style="display:none"><form id="matCons" class="form">${input('name','Item Name')}${input('unit','Unit')}${input('rate','Rate per unit','number','','min="0" step="0.01"')}${input('stock','Stock','number','','min="0" step="0.01"')}<div class="field-full"><button class="btn btn-champagne" type="submit" style="width:100%">Add/Update Consumable</button></div></form><div style="margin-top:24px">${rows(['Name','Unit','Rate','Stock'],mCons.map(c=>`<tr><td>${esc(c.name)}</td><td>${esc(c.unit)}</td><td class="align-right mono">${money(num(c.rate))}</td><td class="align-right mono">${num(c.stock).toFixed(2)}</td></tr>`).join(''))}</div></div></div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Unit Converter</h2></div><div class="card-body"><form id="unitConv" class="form form-grid-3">${input('cvVal','Value','number','','step="any"')}${select('cvFrom','From',Object.keys(UNITS))}${select('cvTo','To',Object.keys(UNITS))}</form><p class="muted" id="cvResult" style="margin-top:12px;padding:12px;background:var(--bg-surface);border-radius:var(--radius-md);border:1px solid var(--border-subtle);min-height:48px;display:flex;align-items:center">Enter value to convert</p></div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Bill of Materials (BOM) / Job Card</h2></div><div class="card-body"><form id="bom" class="form"><div class="field-row" style="margin-bottom:16px;display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${input('bomCode','BOM Code')}${input('bomName','Design Name')}</div><div class="field-row" style="margin-bottom:16px;display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${select('bomMetal','Metal Type',['Gold','Silver','Platinum'])}${select('bomPurity','Purity',metalPurities)}</div><div class="field-row" style="margin-bottom:16px;display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${input('bomGross','Gross Weight','number','','min="0" step="0.001"')}${select('bomGrossUnit','Gross Unit',Object.keys(UNITS))}</div><div class="field-row" style="margin-bottom:16px;display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${input('bomStoneW','Stone/Wax Weight','number','0','min="0" step="0.001"')}${select('bomStoneUnit','Stone Unit',Object.keys(UNITS))}</div>
-<div class="section"><h4 style="font-size:0.875rem;font-weight:600;color:var(--text-secondary);margin-bottom:12px">Wastage (Jarti)</h4><div class="field-row" style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${select('bomJartiPreset','Preset',Object.keys(jartiPresets))}${input('bomWastage','Wastage %','number',jartiPresets['Machine Cast'],'min="0" max="20" step="0.1"')}</div></div>
-<div class="section"><h4 style="font-size:0.875rem;font-weight:600;color:var(--text-secondary);margin-bottom:12px">Making Charges (Jyala)</h4>${select('bomMakingType','Method',['Per Gram','Per Tola','Flat Rate','% of Metal Value','Tiered by Process'])}${input('bomMakingRate','Rate','number','0','min="0" step="0.01"')}<div id="bomTiered" class="hidden" style="margin-top:16px;padding:16px;background:var(--bg-surface);border-radius:var(--radius-md);border:1px solid var(--border-subtle)"><h5 style="font-size:0.875rem;font-weight:600;color:var(--text-secondary);margin-bottom:12px">Tiered Process Rates</h5><div class="form" style="margin:0">${processTypes.map(p=>input(`bomTier_${p}`,p,'number','0','min="0" step="0.01"')).join('')}</div></div></div>
-<div class="section"><h4 style="font-size:0.875rem;font-weight:600;color:var(--text-secondary);margin-bottom:12px">Stones & Gems</h4><div id="bomStones"></div><div style="margin-top:12px"><button type="button" class="btn btn-secondary" data-addstone"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Add Stone Row</button></div></div>
-<div class="section"><h4 style="font-size:0.875rem;font-weight:600;color:var(--text-secondary);margin-bottom:12px">Additional Costs</h4><div class="field-row" style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${input('bomHallmark','Hallmark/HUID Fee','number','0','min="0" step="0.01"')}${input('bomOverhead','Overhead % or Fixed','number','0','min="0" step="0.01"')}</div></div>
-<div style="display:flex;gap:12px;margin-top:24px;padding-top:16px;border-top:1px solid var(--border-subtle)"><button class="btn btn-gold" type="submit" style="flex:1">Save BOM / Calculate Cost</button></div></form></div></div>
-<div class="card section"><div class="card-header"><h2 class="card-title">Saved BOMs</h2></div><div class="card-body" style="padding:0">${rows(['Code','Design','Net Wt','Metal','Wastage','Making','Stones','Total','Action'],bomTable)}</div></div>
-${boms.length?boms.map(renderCostCard).join(''):'<div class="card section"><div class="card-body empty"><svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6v6H9z"/></svg><p class="empty-title">No BOMs created yet</p><p class="empty-message">Create your first Bill of Materials above</p></div></div>'}`;
+<div class="page-header"><div class="page-header-top"><div><h1 class="page-title">${PAGE_TITLES.production[0]}</h1><p class="page-subtitle">${PAGE_TITLES.production[1]}</p></div><div class="page-header-actions"><button class="btn btn-champagne" data-tab="karigar">${t('Manage Jobs & Karigars')}</button></div></div></div>
+<div class="metric-grid">${JOB_STATUSES.map(s=>card(t(s), jobs.filter(j=>j.status===s).length, t('Production jobs'))).join('')}${card(t('Total Issued (g)'), rnd(jobs.reduce((s,j)=>s+getJobIssuedWeight(j),0)).toFixed(3), t('Across jobs'))}${card(t('Total Wastage (g)'), rnd(jobs.reduce((s,j)=>s+num(j.wastageActual),0)).toFixed(3), t('Actual'))}</div>
+<div class="card"><div class="card-header"><h2 class="card-title">${t('Production Stages Pipeline')}</h2></div><div class="card-body"><div class="kanban">${stageColumns}</div><p class="note note-caution" style="margin-top:12px">${t('Open a job in Karigar & Jobs to update stages, photographs, quality checks, vouchers and charges. Metal issues/returns automatically update metal balances.')}</p></div></div>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Production Jobs & Material Flow')}</h2></div><div class="card-body" style="padding:0">${rows([t('Job'),t('Description'),t('Karigar'),t('Status'),t('Deadline'),t('Issued (g)'),t('Returned (g)'),t('Wastage (g)'),t('Labour'),t('Action')],jobsRows)}</div></div>
+<div class="layout-2col section"><div class="card"><div class="card-header"><h2 class="card-title">${t('Metal Issue Vouchers')}</h2></div><div class="card-body" style="padding:0">${rows([t('Date'),t('Job'),t('Karigar'),t('Voucher'),t('Metal'),t('Weight (g)'),t('Notes')], allIssues.sort((a,b)=>(b.date||'').localeCompare(a.date||'')).map(m=>`<tr><td class="mono">${esc(m.date||'')}</td><td><code class="mono">${esc(m.jobCode||'-')}</code></td><td>${esc(m.karigar||'-')}</td><td><code class="mono">${esc(m.voucher||'-')}</code></td><td>${esc(m.metal||'')} ${esc(m.purity||'')}</td><td class="mono align-right">${num(m.weight).toFixed(3)}</td><td>${esc(m.notes||'')}</td></tr>`).join(''))}</div></div><div class="card"><div class="card-header"><h2 class="card-title">${t('Material Returns & Wastage')}</h2></div><div class="card-body" style="padding:0">${rows([t('Date'),t('Job'),t('Karigar'),t('Voucher'),t('Type'),t('Metal'),t('Weight (g)'),t('Notes')], allReturns.sort((a,b)=>(b.date||'').localeCompare(a.date||'')).map(r=>`<tr><td class="mono">${esc(r.date||'')}</td><td><code class="mono">${esc(r.jobCode||'-')}</code></td><td>${esc(r.karigar||'-')}</td><td><code class="mono">${esc(r.voucher||'-')}</code></td><td><span class="badge ${r.type==='WASTAGE'?'badge-warn':'badge-completed'}">${esc(r.type||'RETURN')}</span></td><td>${esc(r.metal||'')} ${esc(r.purity||'')}</td><td class="mono align-right">${num(r.weight).toFixed(3)}</td><td>${esc(r.notes||'')}</td></tr>`).join(''))}</div></div></div>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Raw Materials Master')}</h2></div><div class="card-body"><div class="tabs" style="margin-bottom:20px"><button class="tab active" data-mat-tab="metals">${t('Precious Metals')}</button><button class="tab" data-mat-tab="gemstones">${t('Gemstones & Diamonds')}</button><button class="tab" data-mat-tab="consumables">${t('Consumables')}</button></div>
+<div id="mat-metals" class="mat-tab-panel"><form id="matMetal" class="form">${select('purity',t('Purity'),metalPurities)}${input('rate',t('Rate per gram (NPR)'),'number','','min="0" step="0.01"')}${input('stock',t('Stock (g)'),'number','','min="0" step="0.001"')}<div class="field-full"><button class="btn btn-champagne" type="submit" style="width:100%">${t('Add/Update Metal')}</button></div></form><div style="margin-top:24px">${rows([t('Purity'),t('Rate/g'),t('Stock (g)')],mMetals.map(m=>`<tr><td>${esc(m.purity)}</td><td class="align-right mono">${money(num(m.rate))}</td><td class="align-right mono">${num(m.stock).toFixed(3)}</td></tr>`).join(''))}</div></div>
+<div id="mat-gemstones" class="mat-tab-panel" style="display:none"><form id="matStone" class="form">${select('type',t('Stone Type'),stoneTypes)}${input('rate',t('Rate per carat (NPR)'),'number','','min="0" step="0.01"')}${input('stock',t('Stock (carat)'),'number','','min="0" step="0.01"')}${input('cert',t('Certification'))}<div class="field-full"><button class="btn btn-champagne" type="submit" style="width:100%">${t('Add/Update Stone')}</button></div></form><div style="margin-top:24px">${rows([t('Type'),t('Rate/ct'),t('Stock (ct)'),t('Cert')],mStones.map(s=>`<tr><td>${esc(s.type)}</td><td class="align-right mono">${money(num(s.rate))}</td><td class="align-right mono">${num(s.stock).toFixed(2)}</td><td>${esc(s.cert||'-')}</td></tr>`).join(''))}</div></div>
+<div id="mat-consumables" class="mat-tab-panel" style="display:none"><form id="matCons" class="form">${input('name',t('Item Name'))}${input('unit',t('Unit'))}${input('rate',t('Rate per unit'),'number','','min="0" step="0.01"')}${input('stock',t('Stock'),'number','','min="0" step="0.01"')}<div class="field-full"><button class="btn btn-champagne" type="submit" style="width:100%">${t('Add/Update Consumable')}</button></div></form><div style="margin-top:24px">${rows([t('Name'),t('Unit'),t('Rate'),t('Stock')],mCons.map(c=>`<tr><td>${esc(c.name)}</td><td>${esc(c.unit)}</td><td class="align-right mono">${money(num(c.rate))}</td><td class="align-right mono">${num(c.stock).toFixed(2)}</td></tr>`).join(''))}</div></div></div></div>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Unit Converter')}</h2></div><div class="card-body"><form id="unitConv" class="form form-grid-3">${input('cvVal',t('Value'),'number','','step="any"')}${select('cvFrom',t('From'),Object.keys(UNITS))}${select('cvTo',t('To'),Object.keys(UNITS))}</form><p class="muted" id="cvResult" style="margin-top:12px;padding:12px;background:var(--bg-surface);border-radius:var(--radius-md);border:1px solid var(--border-subtle);min-height:48px;display:flex;align-items:center">${t('Enter value to convert')}</p></div></div>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Bill of Materials (BOM) / Job Card')}</h2></div><div class="card-body"><form id="bom" class="form"><div class="field-row" style="margin-bottom:16px;display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${input('bomCode',t('BOM Code'))}${input('bomName',t('Design Name'))}</div><div class="field-row" style="margin-bottom:16px;display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${select('bomMetal',t('Metal Type'),['Gold','Silver','Platinum'])}${select('bomPurity',t('Purity'),metalPurities)}</div><div class="field-row" style="margin-bottom:16px;display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${input('bomGross',t('Gross Weight'),'number','','min="0" step="0.001"')}${select('bomGrossUnit',t('Gross Unit'),Object.keys(UNITS))}</div><div class="field-row" style="margin-bottom:16px;display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${input('bomStoneW',t('Stone/Wax Weight'),'number','0','min="0" step="0.001"')}${select('bomStoneUnit',t('Stone Unit'),Object.keys(UNITS))}</div>
+<div class="section"><h4 style="font-size:0.875rem;font-weight:600;color:var(--text-secondary);margin-bottom:12px">${t('Wastage (Jarti)')}</h4><div class="field-row" style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${select('bomJartiPreset',t('Preset'),Object.keys(jartiPresets))}${input('bomWastage',t('Wastage %'),'number',jartiPresets['Machine Cast'],'min="0" max="20" step="0.1"')}</div></div>
+<div class="section"><h4 style="font-size:0.875rem;font-weight:600;color:var(--text-secondary);margin-bottom:12px">${t('Making Charges (Jyala)')}</h4>${select('bomMakingType',t('Method'),['Per Gram','Per Tola','Flat Rate','% of Metal Value','Tiered by Process'].map(v=>({value:v,label:t(v)})))}${input('bomMakingRate',t('Rate'),'number','0','min="0" step="0.01"')}<div id="bomTiered" class="hidden" style="margin-top:16px;padding:16px;background:var(--bg-surface);border-radius:var(--radius-md);border:1px solid var(--border-subtle)"><h5 style="font-size:0.875rem;font-weight:600;color:var(--text-secondary);margin-bottom:12px">${t('Tiered Process Rates')}</h5><div class="form" style="margin:0">${processTypes.map(p=>input(`bomTier_${p}`,t(p),'number','0','min="0" step="0.01"')).join('')}</div></div></div>
+<div class="section"><h4 style="font-size:0.875rem;font-weight:600;color:var(--text-secondary);margin-bottom:12px">${t('Stones & Gems')}</h4><div id="bomStones"></div><div style="margin-top:12px"><button type="button" class="btn btn-secondary" data-addstone>${icon('plus')} <span>${t('Add Stone Row')}</span></button></div></div>
+<div class="section"><h4 style="font-size:0.875rem;font-weight:600;color:var(--text-secondary);margin-bottom:12px">${t('Additional Costs')}</h4><div class="field-row" style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px">${input('bomHallmark',t('Hallmark/HUID Fee'),'number','0','min="0" step="0.01"')}${input('bomOverhead',t('Overhead % or Fixed'),'number','0','min="0" step="0.01"')}</div></div>
+<div style="display:flex;gap:12px;margin-top:24px;padding-top:16px;border-top:1px solid var(--border-subtle)"><button class="btn btn-champagne" type="submit" style="flex:1">${t('Save BOM / Calculate Cost')}</button></div></form></div></div>
+<div class="card section"><div class="card-header"><h2 class="card-title">${t('Saved BOMs')}</h2></div><div class="card-body" style="padding:0">${rows([t('Code'),t('Design'),t('Net Wt'),t('Metal'),t('Wastage'),t('Making'),t('Stones'),t('Total'),t('Action')],bomTable)}</div></div>
+${boms.length?boms.map(renderCostCard).join(''):`<div class="card section"><div class="card-body empty"><svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6v6H9z"/></svg><p class="empty-title">${t('No BOMs created yet')}</p><p class="empty-message">${t('Create your first Bill of Materials above')}</p></div></div>`}`;
 }
 
 
@@ -3314,8 +3408,187 @@ function resetItemForm(){
   const stone=document.getElementById('stoneDetailsRows'); if(stone) stone.innerHTML='';
   const prev=document.getElementById('imagePreview'); if(prev) prev.innerHTML='';
   ['sku','barcode','qrCode','netWeight','wastageWeight','costPrice','marginPercent'].forEach(id=>{const el=document.getElementById(id); if(el) el.setAttribute('readonly','true');});
+  // Reset to gold category defaults
+  document.getElementById('itemCategory').value='gold';
+  document.querySelectorAll('#itemTypeTabs .tab').forEach(t=>t.classList.toggle('active',t.dataset.cat==='gold'));
+  toggleStoneSection('gold');
+  updateMetalTypeDropdown('gold');
+  // Clear draft on successful submit/reset
+  localStorage.removeItem('ratnaos_inventory_draft');
 }
-function toggleStoneSection(category){const sec=document.getElementById('stoneDetailsSection'); if(sec) sec.style.display=(category==='diamond'||category==='gemstone')?'block':'none';}
+
+function saveItemDraft(){
+  const form=document.getElementById('itemForm'); if(!form) return;
+  const data = Object.fromEntries(new FormData(form).entries());
+  // Also capture stone details
+  const stoneDetails=[]; document.querySelectorAll('#stoneDetailsRows .stone-detail-row').forEach(row=>{const idx=row.dataset.idx; stoneDetails.push({idx, type: row.querySelector(`[name="stoneType_${idx}"]`)?.value, qty: row.querySelector(`[name="stoneQty_${idx}"]`)?.value, weight: row.querySelector(`[name="stoneWt_${idx}"]`)?.value, unit: row.querySelector(`[name="stoneUnit_${idx}"]`)?.value, rate: row.querySelector(`[name="stoneRate_${idx}"]`)?.value, setting: row.querySelector(`[name="stoneSetting_${idx}"]`)?.value});});
+  data.stoneDetails = stoneDetails;
+  data.editId = form.dataset.editId;
+  data.category = document.getElementById('itemCategory')?.value;
+  localStorage.setItem('ratnaos_inventory_draft', JSON.stringify(data));
+}
+
+function loadItemDraft(){
+  const form=document.getElementById('itemForm'); if(!form) return;
+  try {
+    const draft = JSON.parse(localStorage.getItem('ratnaos_inventory_draft') || '{}');
+    if(!draft || !draft.name) return;
+    Object.entries(draft).forEach(([key, val]) => {
+      if(key === 'stoneDetails') return;
+      const el = document.getElementById(key) || form.querySelector(`[name="${key}"]`);
+      if(el) el.value = val;
+    });
+    if(draft.stoneDetails && draft.stoneDetails.length){
+      const wrap=document.getElementById('stoneDetailsRows'); if(wrap){wrap.innerHTML=''; draft.stoneDetails.forEach(st=>addStoneRow(st, st.idx));}
+    }
+    if(draft.category) document.getElementById('itemCategory').value = draft.category;
+    if(draft.editId) form.dataset.editId = draft.editId;
+    updateCalculatedFields();
+    notify(t('Draft restored'), 'info');
+  } catch(e) { console.warn('Draft load failed', e); }
+}
+
+// Auto-save draft on input/change
+document.addEventListener('input', e => { if(e.target.closest('#itemForm')) saveItemDraft(); }, {passive: true});
+document.addEventListener('change', e => { if(e.target.closest('#itemForm')) saveItemDraft(); }, {passive: true});
+
+// ============================================================
+// GENERIC FORM DRAFTS — auto-save + restore
+// Covers metal txn, exchange, karigar profile, production job,
+// and the job issue/return/QC modals.
+// ============================================================
+const DRAFT_FORMS = new Set(['metalTxnForm','exchange','karigarForm','jobForm','jobIssueModalForm','jobReturnModalForm','jobQCForm','jobUpdateForm','jobCreateForm','jobIssueForm','jobReturnForm']);
+const DRAFT_PREFIX = 'ratnaos-draft:';
+function draftKey(formId){ return DRAFT_PREFIX + formId; }
+function saveFormDraft(form){
+  if(!form || !form.id || !DRAFT_FORMS.has(form.id)) return;
+  const values = {};
+  try { new FormData(form).forEach((v,k)=>{ if(k) values[k]=v; }); } catch(_) { return; }
+  try { localStorage.setItem(draftKey(form.id), JSON.stringify({ values, editId: form.dataset.editId || '', jobId: form.dataset.jobId || '', ts: Date.now() })); } catch(_) {}
+}
+function clearFormDraft(formId){ try { localStorage.removeItem(draftKey(formId)); } catch(_) {} }
+function restoreFormDraft(form){
+  if(!form || !form.id || !DRAFT_FORMS.has(form.id)) return;
+  let d = null;
+  try { d = JSON.parse(localStorage.getItem(draftKey(form.id)) || 'null'); } catch(_) { return; }
+  if(!d || !d.values) return;
+  let applied = false;
+  Object.entries(d.values).forEach(([k,v]) => {
+    let el = null;
+    try { el = form.querySelector('[name="' + k.replace(/\\/g,'\\\\').replace(/"/g,'\\"') + '"]'); } catch(_) {}
+    if(!el){ const byId = document.getElementById(k); if(byId && form.contains(byId)) el = byId; }
+    if(el && typeof el.value === 'string'){ el.value = v; applied = true; }
+  });
+  if(d.editId && form.id === 'karigarForm'){
+    const cur = form.dataset.editId || '';
+    if(cur === (d.editId || '')) form.dataset.editId = d.editId;
+    else return;
+  }
+  if(d.jobId && form.dataset.jobId !== undefined) form.dataset.jobId = d.jobId;
+  if(applied) form.dataset.draftRestored = '1';
+}
+function restoreDraftsIn(scope){
+  const root = scope || document;
+  root.querySelectorAll('form[id]').forEach(f => { if(!f.dataset.draftRestored) restoreFormDraft(f); });
+}
+document.addEventListener('input', e => { const f = e.target.closest('form[id]'); if(f) saveFormDraft(f); }, {passive:true});
+document.addEventListener('change', e => { const f = e.target.closest('form[id]'); if(f) saveFormDraft(f); }, {passive:true});
+
+// ---- POS draft (cart + discount + customer + payments) ----
+const POS_DRAFT_KEY = 'ratnaos-pos-draft';
+function posPaymentsFromDOM(){
+  const wrap = document.getElementById('posPaymentRows');
+  if(!wrap) return [];
+  return [...wrap.querySelectorAll('.payment-row')].map(r => ({ method: r.querySelector('[name="payMethod"]')?.value || 'Cash', amount: r.querySelector('[name="payAmount"]')?.value || '' }));
+}
+function savePOSDraft(){
+  if(tab !== 'pos') return;
+  const d = { cart: state.posCart || [], extraDiscount: num(document.getElementById('posExtraDiscount')?.value || 0), customerId: document.getElementById('posCustomerSelect')?.value || '', payments: posPaymentsFromDOM(), ts: Date.now() };
+  try { localStorage.setItem(POS_DRAFT_KEY, JSON.stringify(d)); } catch(_) {}
+}
+function clearPOSDraft(){ try { localStorage.removeItem(POS_DRAFT_KEY); } catch(_) {} }
+function loadPOSDraftIntoState(){
+  let d = null;
+  try { d = JSON.parse(localStorage.getItem(POS_DRAFT_KEY) || 'null'); } catch(_) {}
+  if(!d || !Array.isArray(d.cart)) return;
+  state.posCart = d.cart;
+  state.posExtraDiscount = num(d.extraDiscount || 0);
+  render.__posDraftPayments = Array.isArray(d.payments) ? d.payments : [];
+  render.__posDraftCustomer = d.customerId || '';
+}
+function restorePOSDraftDOM(){
+  const disc = document.getElementById('posExtraDiscount');
+  if(disc && state.posExtraDiscount) disc.value = String(state.posExtraDiscount);
+  const cust = document.getElementById('posCustomerSelect');
+  if(cust && render.__posDraftCustomer) cust.value = render.__posDraftCustomer;
+  const wrap = document.getElementById('posPaymentRows');
+  if(wrap && Array.isArray(render.__posDraftPayments) && render.__posDraftPayments.length){
+    wrap.innerHTML = render.__posDraftPayments.map(p => `<div class="payment-row" style="display:flex;gap:8px;margin-bottom:8px"><select class="field-select" name="payMethod" style="flex:1">${PAYMENT_METHODS.map(m => `<option value="${esc(m)}" ${p.method === m ? 'selected' : ''}>${esc(m)}</option>`).join('')}</select><input class="field-input" name="payAmount" type="number" style="width:120px" min="0" step="0.01" value="${esc(p.amount)}"><button type="button" class="btn btn-ghost btn-sm" data-pos-remove-pay>×</button></div>`).join('');
+  }
+}
+function refreshPOSUI(){
+  const cart = state.posCart || [];
+  const extra = Math.min(100, Math.max(0, num(document.getElementById('posExtraDiscount')?.value || 0)));
+  state.posExtraDiscount = extra;
+  cart.forEach((c, idx) => {
+    const qty = Math.max(1, num(c.qty) || 1);
+    c.qty = qty;
+    const subtotal = roundCurrency2(num(c.basePrice) * qty);
+    const discount = roundCurrency2(subtotal * extra / 100);
+    const gross = roundCurrency2(subtotal - discount);
+    const tax = calcTax(gross);
+    const inclusive = state.settings.taxInclusive !== false;
+    const taxable = inclusive ? roundCurrency2(gross - tax) : gross;
+    const total = inclusive ? gross : roundCurrency2(gross + tax);
+    Object.assign(c, { subtotal, discount, taxable, tax, total });
+    const cell = document.querySelector('[data-pos-line-total="' + idx + '"]');
+    if(cell) cell.textContent = money(total);
+  });
+  const totals = calcCartTotals(cart);
+  const setSum = (k,v) => { const el = document.querySelector('[data-pos-sum="' + k + '"]'); if(el) el.textContent = money(v); };
+  setSum('subtotal', totals.subtotal); setSum('discount', totals.discount); setSum('tax', totals.tax); setSum('total', totals.total);
+  const cnt = document.getElementById('posCartCount'); if(cnt) cnt.textContent = String(cart.length);
+  const rowsEls = document.querySelectorAll('#posPaymentRows .payment-row');
+  if(rowsEls.length === 1){
+    const amt = rowsEls[0].querySelector('[name="payAmount"]');
+    if(amt && !amt.dataset.touched) amt.value = totals.total.toFixed(2);
+  }
+  updatePaymentSummary();
+  savePOSDraft();
+}
+function updateMetalTxnPreview(){
+  const f = document.getElementById('metalTxnForm'); if(!f) return;
+  const weight = num(f.querySelector('[name="metalWeight"]')?.value);
+  const unit = f.querySelector('[name="metalUnit"]')?.value || 'gram';
+  const rate = num(f.querySelector('[name="metalRate"]')?.value);
+  const grams = toGram(weight, unit);
+  const value = rnd(grams * rate);
+  const out = document.getElementById('metalTxnPreview');
+  if(out) out.innerHTML = (grams > 0 && rate > 0)
+    ? `${t('Total Value')}: <strong>${money(value)}</strong> <span class="muted">(${grams.toFixed(3)} g × ${money(rate)})</span>`
+    : `<span class="muted">${t('Enter weight and rate to preview the value')}</span>`;
+  const mv = f.querySelector('[name="metalValue"]');
+  if(mv && !mv.value && grams > 0 && rate > 0) mv.value = value.toFixed(2);
+}
+function updateExchangePreview(){
+  const f = document.getElementById('exchange'); if(!f) return;
+  const weight = num(f.querySelector('[name="weight"]')?.value);
+  const purity = num(f.querySelector('[name="purity"]')?.value) || 24;
+  const rate = num(f.querySelector('[name="rate"]')?.value);
+  const deduction = num(f.querySelector('[name="deduction"]')?.value);
+  const value = rnd(weight * purity / 24 * rate - deduction);
+  const out = document.getElementById('exchangePreview');
+  if(out) out.innerHTML = weight > 0
+    ? `${t('Estimated Value')}: <strong>${money(value)}</strong> <span class="muted">(${weight.toFixed(3)} g × ${purity}K × ${money(rate)}${deduction ? ' − ' + money(deduction) : ''})</span>`
+    : `<span class="muted">${t('Enter weight and rate to preview the value')}</span>`;
+}
+
+// Load draft when inventory tab opens
+function toggleStoneSection(category){
+  const sec=document.getElementById('stoneDetailsSection');
+  if(sec) sec.style.display=(category==='diamond'||category==='gemstone')?'block':'none';
+}
+
 function addStoneRow(stone={},index=null){
   const idx=index!==null?index:Date.now(); const wrap=document.getElementById('stoneDetailsRows'); if(!wrap) return;
   const stoneTypeOpts=STONE_TYPES.map(s=>`<option value="${esc(s)}" ${stone.type===s?'selected':''}>${esc(s)}</option>`).join('');
@@ -3337,6 +3610,15 @@ function updateCalculatedFields(){
   const costPrice=rnd(metalCost+wastageCost+makingCharge+stoneCost); if(g('costPrice')) g('costPrice').value=costPrice.toFixed(2);
   if(sellingPrice>0 && g('marginPercent')) g('marginPercent').value=rnd((sellingPrice-costPrice)/sellingPrice*100).toFixed(1);
 }
+function updateMetalTypeDropdown(category){
+  const select=document.getElementById('metalType');
+  if(!select) return;
+  const types=METAL_TYPES_BY_CATEGORY[category]||METAL_TYPES;
+  const current=select.value;
+  select.innerHTML=types.map(t=>`<option value="${esc(t)}" ${t===current?'selected':''}>${esc(t)}</option>`).join('');
+  if(!types.includes(current)) select.value=types[0];
+}
+
 function populateItemForm(item){
   const form=document.getElementById('itemForm'); if(!form) return;
   form.dataset.editId=item.id; const btn=document.getElementById('submitBtnText'); if(btn) btn.textContent='Update Item';
@@ -3350,6 +3632,7 @@ function populateItemForm(item){
   set('barcode',item.barcode||''); set('qrCode',item.qrCode||''); set('status',item.status||'stock'); set('location',item.location||'Showcase'); set('tags',(item.tags||[]).join(', '));
   document.querySelectorAll('#itemTypeTabs .tab').forEach(t=>t.classList.toggle('active',t.dataset.cat===(item.category||'gold')));
   toggleStoneSection(item.category||'gold');
+  updateMetalTypeDropdown(item.category||'gold');
   const sw=document.getElementById('stoneDetailsRows'); if(sw){sw.innerHTML=''; (item.stoneDetails||[]).forEach((st,i)=>addStoneRow(st,i));}
   const ip=document.getElementById('imagePreview'); if(ip){ip.innerHTML=''; (item.images||[]).forEach((img,i)=>{const d=document.createElement('div'); d.style.position='relative'; d.innerHTML=`<img src="${img.data}" alt="${esc(img.alt||'')}" style="width:70px;height:70px;object-fit:cover;border-radius:6px"><button type="button" class="btn btn-ghost btn-sm" data-remove-image="${i}" style="position:absolute;top:-6px;right:-6px">×</button>`; ip.appendChild(d);});}
   updateCalculatedFields();
@@ -3389,31 +3672,246 @@ function renderInvoiceHTML(sale){
 }
 function showInvoiceModal(sale){const modal=document.createElement('div'); modal.className='modal-overlay'; modal.innerHTML=`<div class="modal" style="max-width:700px"><div class="modal-header"><h3 class="modal-title">Invoice ${esc(sale.invoice)}</h3><button class="modal-close" data-close-modal>×</button></div><div class="modal-body">${renderInvoiceHTML(sale)}</div><div class="modal-footer"><button class="btn btn-champagne" data-print-invoice="${esc(sale.id)}">Print</button><button class="btn btn-ghost" data-close-modal>Close</button></div></div>`; document.body.appendChild(modal); modal.querySelectorAll('[data-close-modal]').forEach(b=>b.addEventListener('click',()=>modal.remove())); modal.addEventListener('click',e=>{if(e.target===modal)modal.remove();});}
 function printInvoice(saleId){const sale=state.sales.find(s=>s.id===saleId); if(!sale) return; const w=window.open('','_blank'); if(!w) return; w.document.write(`<html><head><title>${esc(sale.invoice)}</title><style>body{font-family:Arial;padding:20px}table{width:100%;border-collapse:collapse}th,td{border:1px solid #ddd;padding:8px}</style></head><body>${renderInvoiceHTML(sale)}<script>window.onload=()=>window.print()<\/script></body></html>`); w.document.close();}
-function completePOSale(){
+async function completePOSale(){
   const cart=state.posCart||[]; if(!cart.length) return alert(t('Cart is empty'));
   const customerId=document.getElementById('posCustomerSelect')?.value; const customer=customerId?getCustomer(customerId):null;
   const wrap=document.getElementById('posPaymentRows'); const payments=[]; let totalPaid=0;
   wrap?.querySelectorAll('.payment-row').forEach(row=>{const method=row.querySelector('[name="payMethod"]')?.value; const amount=num(row.querySelector('[name="payAmount"]')?.value); if(amount>0){payments.push({method,amount}); totalPaid+=amount;}});
   const totals=calcCartTotals(cart); if(totalPaid+0.01<totals.total) return alert(t('Payment is less than total.'));
   const invoice=generateInvoiceNumber();
-  const saleItems=cart.map(c=>({itemId:c.itemId,itemCode:c.item.code,itemName:c.item.name,itemSku:c.item.sku,metalType:c.item.metalType||c.item.metal,purity:c.item.purity,netWeight:c.item.netWeight||c.item.weight,basePrice:c.basePrice,qty:c.qty,subtotal:c.subtotal,discount:c.discount,taxable:c.taxable,tax:c.tax,total:c.total}));
-  const sale={id:id(),invoice,date:new Date().toISOString(),customerId:customer?.id||null,customerName:customer?.name||'Walk-in Customer',customerPhone:customer?.phone||'',items:saleItems,payments,subtotal:totals.subtotal,discount:totals.discount,taxable:totals.taxable,tax:totals.tax,taxRate:state.settings.taxRate,taxLabel:state.settings.taxLabel,total:totals.total,status:'completed'};
-  state.sales.unshift(sale);
-  cart.forEach(c=>{const item=state.items.find(i=>i.id===c.itemId); if(item){item.status='sold'; item.updatedAt=new Date().toISOString(); recordMovement(item.id,'OUT','Sale',c.qty,num(item.netWeight||item.weight)*c.qty,invoice,'POS Sale - '+sale.customerName);} });
-  if(customer) updateCustomerStats(customer.id, totals.total);
-  state.posCart=[]; postSale(state, sale, state.items); save('POS Sale completed', invoice+' - '+money(totals.total)); render(); showInvoiceModal(sale);
-}
-function savePOSQuote(){const cart=state.posCart||[]; if(!cart.length) return alert(t('Cart is empty')); const customerId=document.getElementById('posCustomerSelect')?.value; const customer=customerId?getCustomer(customerId):null; const totals=calcCartTotals(cart); const quote={id:id(),quoteNo:'QUO-'+Date.now().toString(36).toUpperCase(),date:new Date().toISOString(),customerId:customer?.id||null,customerName:customer?.name||'Walk-in Customer',items:cart.map(c=>({itemId:c.itemId,qty:c.qty,basePrice:c.basePrice,subtotal:c.subtotal,total:c.total})),subtotal:totals.subtotal,discount:totals.discount,tax:totals.tax,total:totals.total,status:'quote'}; state.quotes.unshift(quote); save('Quote saved',quote.quoteNo); alert(t('Quote saved')+': '+quote.quoteNo); render();}
+  const idempotencyKey=`pos_sale:${invoice}`;
 
-function showMetalTxnModal(txn=null){const modal=document.createElement('div'); modal.className='modal-overlay'; const typeOptions=METAL_TXN_TYPES.map(x=>`<option value="${x.value}" ${txn&&txn.type===x.value?'selected':''}>${t(x.label)}</option>`).join(''); const metal=txn?.metal||'Gold'; const purityOpts=(metal==='Gold'?GOLD_PURITIES:SILVER_PURITIES).map(p=>`<option value="${p}" ${txn&&txn.purity===p?'selected':''}>${p}</option>`).join(''); modal.innerHTML=`<div class="modal" style="max-width:560px"><div class="modal-header"><h3 class="modal-title">${t(txn?'Edit Metal Transaction':'New Metal Transaction')}</h3><button class="modal-close" data-close-modal>×</button></div><div class="modal-body"><form id="metalTxnForm"><input type="hidden" name="txnId" value="${txn?.id||''}"><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">${select('type','Type',METAL_TXN_TYPES.map(x=>({value:x.value,label:t(x.label)})), txn?.type||'PURCHASE')}${input('date','Date','date',txn?.date||new Date().toISOString().slice(0,10))}${select('metal','Metal',['Gold','Silver'], metal)}<div class="field"><label class="field-label">${t('Purity')}</label><select class="field-select" name="purity" id="metalPurity">${purityOpts}</select></div>${input('weight','Weight','number',txn?.weight||'','min="0" step="0.001"')}${select('unit','Unit',METAL_UNITS, txn?.unit||'gram')}${input('rate','Rate/g','number',txn?.rate||'','min="0" step="0.01"')}${input('value','Value','number',txn?.value||'','min="0" step="0.01"')}${input('reference','Reference','text',txn?.reference||'')}${input('karigar','Karigar','text',txn?.karigar||'')}${input('jobCode','Job Code','text',txn?.jobCode||'')}${input('customer','Customer','text',txn?.customer||'')}</div>${textarea('notes','Notes',txn?.notes||'')}</form></div><div class="modal-footer"><button class="btn btn-primary" data-metal-save-txn>Save</button><button class="btn btn-ghost" data-close-modal>Cancel</button></div></div>`; document.body.appendChild(modal); modal.querySelectorAll('[data-close-modal]').forEach(b=>b.addEventListener('click',()=>modal.remove())); modal.addEventListener('click',e=>{if(e.target===modal)modal.remove();}); modal.querySelector('#metalMetal, select[name="metal"]')?.addEventListener('change',e=>{const m=e.target.value; const ps=document.getElementById('metalPurity'); if(ps) ps.innerHTML=(m==='Gold'?GOLD_PURITIES:SILVER_PURITIES).map(p=>`<option value="${p}">${p}</option>`).join('');});}
-function saveMetalTxnFromModal(){const form=document.getElementById('metalTxnForm'); if(!form) return; const d=data(form); const txnId=d.txnId; const weight=num(d.weight); if(!(weight>0)) return alert(t('Weight required')); const payload={type:d.type,metal:d.metal,purity:d.purity,unit:d.unit||'gram',weight:toGram(weight,d.unit||'gram'),rate:num(d.rate),value:num(d.value)||rnd(toGram(weight,d.unit||'gram')*num(d.rate)),adjustment:0,reference:d.reference||generateMetalTxnNumber(d.type),notes:d.notes,karigar:d.karigar,jobCode:d.jobCode,customer:d.customer,date:d.date,posted:true}; if(txnId){const idx=state.metalManagement.transactions.findIndex(t=>t.id===txnId); if(idx>=0){if(!canEditTransaction(state.metalManagement.transactions[idx])) return alert(t('Cannot edit posted transaction in closed period')); state.metalManagement.transactions[idx]={...state.metalManagement.transactions[idx],...payload,updatedAt:new Date().toISOString()}; save('Metal transaction updated',payload.reference);} } else {recordMetalTxn(payload);} form.closest('.modal-overlay')?.remove(); render();}
+  if(window.RatnaOS?.idempotencyHas?.(idempotencyKey)){
+    alert(t('Sale already processed.'));
+    return;
+  }
+
+  // CSRF protection for state-changing financial operation
+  if(window.RatnaOS?.csrf?.validate?.(window.RatnaOS.csrf.token()) === false){
+    alert(t('Session validation failed. Please refresh and try again.'));
+    return;
+  }
+
+  const result = await window.RatnaOS.atomicOperation(idempotencyKey, async () => {
+    const currentCart = state.posCart || [];
+    if (!currentCart.length) throw new Error(t('Cart is empty'));
+    const currentTotals = calcCartTotals(currentCart);
+
+    // Atomic stock check + deduct: no other operation can interleave while lock is held.
+    const InsufficientStockErr = window.RatnaOS?.errors?.InsufficientStockError || Error;
+    const saleItems = [];
+    for (const c of currentCart) {
+      const item = state.items.find(i => i.id === c.itemId);
+      if (!item) throw new InsufficientStockErr('Item not found: ' + c.itemId);
+      if (item.status !== 'stock') throw new InsufficientStockErr(t('Item no longer in stock') + ': ' + item.code);
+      const available = num(item.netWeight ?? item.weight);
+      const itemWeight = num(item.netWeight ?? item.weight) * c.qty;
+      if (itemWeight > available) {
+        throw new InsufficientStockErr(t('Insufficient stock') + ': ' + item.code + ' (' + available.toFixed(3) + 'g available)');
+      }
+      item.status = 'sold';
+      item.updatedAt = new Date().toISOString();
+      saleItems.push({
+        itemId: c.itemId, itemCode: item.code, itemName: item.name, itemSku: c.item.sku,
+        metalType: item.metalType || item.metal, purity: item.purity,
+        netWeight: item.netWeight || item.weight, basePrice: c.basePrice, qty: c.qty,
+        subtotal: c.subtotal, discount: c.discount, taxable: c.taxable, tax: c.tax, total: c.total
+      });
+    }
+
+    const sale = {
+      id: id(), invoice, date: new Date().toISOString(),
+      customerId: customer?.id || null, customerName: customer?.name || t('Walk-in Customer'),
+      customerPhone: customer?.phone || '', items: saleItems, payments,
+      subtotal: currentTotals.subtotal, discount: currentTotals.discount,
+      taxable: currentTotals.taxable, tax: currentTotals.tax,
+      taxRate: state.settings.taxRate, taxLabel: state.settings.taxLabel,
+      total: currentTotals.total, status: 'completed'
+    };
+
+    state.sales.unshift(sale);
+    currentCart.forEach(c => {
+      const item = state.items.find(i => i.id === c.itemId);
+      if (item) {
+        recordMovement(item.id, 'OUT', 'Sale', c.qty, num(item.netWeight ?? item.weight) * c.qty, invoice, 'POS Sale - ' + sale.customerName);
+      }
+    });
+    if (customer) updateCustomerStats(customer.id, currentTotals.total);
+    state.posCart = [];
+    postSale(state, sale, sale.items);
+    save('POS Sale completed', invoice + ' - ' + money(currentTotals.total));
+    return { success: true, sale, invoice };
+  });
+
+  if (result && result.success) {
+    clearPOSDraft();
+    state.posExtraDiscount = 0;
+    render();;
+    showInvoiceModal(result.sale);
+  } else if (result) {
+    alert(result.error || t('Sale failed'));
+  }
+}
+function savePOSQuote(){const cart=state.posCart||[]; if(!cart.length) return alert(t('Cart is empty')); const customerId=document.getElementById('posCustomerSelect')?.value; const customer=customerId?getCustomer(customerId):null; const totals=calcCartTotals(cart); const quote={id:id(),quoteNo:'QUO-'+Date.now().toString(36).toUpperCase(),date:new Date().toISOString(),customerId:customer?.id||null,customerName:customer?.name||t('Walk-in Customer'),items:cart.map(c=>({itemId:c.itemId,qty:c.qty,basePrice:c.basePrice,subtotal:c.subtotal,total:c.total})),subtotal:totals.subtotal,discount:totals.discount,tax:totals.tax,total:totals.total,status:'quote'}; state.quotes.unshift(quote); save('Quote saved',quote.quoteNo); alert(t('Quote saved')+': '+quote.quoteNo); render();}
+
+function showMetalTxnModal(txn=null){const modal=document.createElement('div'); modal.className='modal-overlay'; const typeOptions=METAL_TXN_TYPES.map(x=>`<option value="${x.value}" ${txn&&txn.type===x.value?'selected':''}>${t(x.label)}</option>`).join(''); const metal=txn?.metal||'Gold'; const purityOpts=(metal==='Gold'?GOLD_PURITIES:SILVER_PURITIES).map(p=>`<option value="${p}" ${txn&&txn.purity===p?'selected':''}>${p}</option>`).join(''); modal.innerHTML=`<div class="modal" style="max-width:560px"><div class="modal-header"><h3 class="modal-title">${t(txn?'Edit Metal Transaction':'New Metal Transaction')}</h3><button class="modal-close" data-close-modal>×</button></div><div class="modal-body"><form id="metalTxnModalForm"><input type="hidden" name="txnId" value="${txn?.id||''}"><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">${select('type','Type',METAL_TXN_TYPES.map(x=>({value:x.value,label:t(x.label)})), txn?.type||'PURCHASE')}${input('date','Date','date',txn?.date||new Date().toISOString().slice(0,10))}${select('metal','Metal',['Gold','Silver'], metal)}<div class="field"><label class="field-label">${t('Purity')}</label><select class="field-select" name="purity" id="metalPurity">${purityOpts}</select></div>${input('weight','Weight','number',txn?.weight||'','min="0" step="0.001"')}${select('unit','Unit',METAL_UNITS, txn?.unit||'gram')}${input('rate','Rate/g','number',txn?.rate||'','min="0" step="0.01"')}${input('value','Value','number',txn?.value||'','min="0" step="0.01"')}${input('reference','Reference','text',txn?.reference||'')}${input('karigar','Karigar','text',txn?.karigar||'')}${input('jobCode','Job Code','text',txn?.jobCode||'')}${input('customer','Customer','text',txn?.customer||'')}</div>${textarea('notes','Notes',txn?.notes||'')}</form></div><div class="modal-footer"><button class="btn btn-primary" data-metal-save-txn>Save</button><button class="btn btn-ghost" data-close-modal>Cancel</button></div></div>`; document.body.appendChild(modal); modal.querySelectorAll('[data-close-modal]').forEach(b=>b.addEventListener('click',()=>modal.remove())); modal.addEventListener('click',e=>{if(e.target===modal)modal.remove();}); modal.querySelector('#metalMetal, select[name="metal"]')?.addEventListener('change',e=>{const m=e.target.value; const ps=document.getElementById('metalPurity'); if(ps) ps.innerHTML=(m==='Gold'?GOLD_PURITIES:SILVER_PURITIES).map(p=>`<option value="${p}">${p}</option>`).join('');});}
+async function saveMetalTxnFromModal(){
+  const form=document.getElementById('metalTxnModalForm'); if(!form) return;
+  const d=data(form);
+  const txnId=d.txnId;
+  const weight=num(d.weight);
+  if(!(weight>0)) return alert(t('Weight required'));
+
+  // CSRF protection for state-changing metal ledger operation
+  if(window.RatnaOS?.csrf?.validate?.(window.RatnaOS.csrf.token()) === false){
+    alert(t('Session validation failed. Please refresh and try again.'));
+    return;
+  }
+
+  const payload={type:d.type,metal:d.metal,purity:d.purity,unit:d.unit||'gram',weight:toGram(weight,d.unit||'gram'),rate:num(d.rate),value:num(d.value)||rnd(toGram(weight,d.unit||'gram')*num(d.rate)),adjustment:0,reference:d.reference||generateMetalTxnNumber(d.type),notes:d.notes,karigar:d.karigar,jobCode:d.jobCode,customer:d.customer,date:d.date,posted:true};
+  if(txnId){
+    const idx=state.metalManagement.transactions.findIndex(t=>t.id===txnId);
+    if(idx>=0){
+      if(!canEditTransaction(state.metalManagement.transactions[idx])) return alert(t('Cannot edit posted transaction in closed period'));
+      const idempotencyKey = `metal_txn:update:${txnId}`;
+      if (window.RatnaOS?.idempotencyHas?.(idempotencyKey)) {
+        alert(t('Transaction already updated.'));
+        return;
+      }
+      await window.RatnaOS.atomicOperation(idempotencyKey, async () => {
+        state.metalManagement.transactions[idx] = {...state.metalManagement.transactions[idx], ...payload, updatedAt: new Date().toISOString()};
+        save('Metal transaction updated', payload.reference);
+      });
+    }
+  } else {
+    try {
+      const txn = await recordMetalTxn(payload);
+      if (txn && txn._idempotent) {
+        alert(t('Metal transaction already recorded.'));
+      }
+    } catch (e) {
+      alert(e.message || t('Metal transaction failed'));
+      return;
+    }
+  }
+  form.closest('.modal-overlay')?.remove();
+  render();;
+}
 function exportMetalCSV(){const headers=['Date','Type','Metal','Purity','Weight','Unit','Rate','Value','Reference','Karigar','Job','Customer','Notes','Posted']; const rowsCsv=state.metalManagement.transactions.map(t=>[t.date,t.type,t.metal,t.purity,num(t.weight).toFixed(3),t.unit||'gram',num(t.rate).toFixed(2),num(t.value).toFixed(2),t.reference||'',t.karigar||'',t.jobCode||'',t.customer||'',(t.notes||'').replace(/\n/g,' '),t.posted?'Yes':'No'].map(v=>'"'+String(v??'').replace(/"/g,'""')+'"').join(',')); download('metal-transactions-'+new Date().toISOString().slice(0,10)+'.csv',[headers.join(','),...rowsCsv].join('\n'),'text/csv');}
 
 
+// Production job modals
+function showJobStageModal(jobId){
+  const job=getJob(jobId); if(!job) return; ensureJobShape(job);
+  const modal=document.createElement('div'); modal.className='modal-overlay';
+  const statusOpts=s=>[['pending',t('Pending')],['in_progress',t('In Progress')],['completed',t('Completed')]].map(([v,l])=>`<option value="${v}" ${s.status===v?'selected':''}>${l}</option>`).join('');
+  const rowsHtml=job.stages.map(s=>`<div class="stage-edit-row"><div class="stage-edit-meta"><strong>${esc(t(s.label||s.id))}</strong><div class="small muted">${s.startedAt?esc(fmtDate(s.startedAt)):'-'} ${s.completedAt?'→ '+esc(fmtDate(s.completedAt)):''}</div></div><div class="stage-edit-controls"><select class="field-select" data-modal-stage-status="${esc(s.id)}">${statusOpts(s)}</select><input class="field-input" placeholder="${t('Notes')}" value="${esc(s.notes||'')}" data-modal-stage-note="${esc(s.id)}"></div></div>`).join('');
+  modal.innerHTML=`<div class="modal" style="max-width:560px"><div class="modal-header"><h3 class="modal-title">${t('Production Stages')} · ${esc(job.code||'')}</h3><button class="modal-close" data-close-modal>×</button></div><div class="modal-body">${rowsHtml}</div><div class="modal-footer"><button class="btn btn-champagne" data-save-stages>${t('Save')}</button><button class="btn btn-ghost" data-close-modal>${t('Cancel')}</button></div></div>`;
+  document.body.appendChild(modal);
+  modal.querySelectorAll('[data-close-modal]').forEach(b=>b.addEventListener('click',()=>modal.remove()));
+  modal.addEventListener('click',e=>{if(e.target===modal)modal.remove();});
+  modal.querySelector('[data-save-stages]').addEventListener('click',()=>{
+    modal.querySelectorAll('[data-modal-stage-status]').forEach(sel=>{
+      const st=job.stages.find(s=>s.id===sel.dataset.modalStageStatus); if(!st) return;
+      const next=sel.value;
+      if(next!==st.status){ if(next==='in_progress'&&!st.startedAt) st.startedAt=new Date().toISOString(); if(next==='completed'){ if(!st.startedAt) st.startedAt=new Date().toISOString(); if(!st.completedAt) st.completedAt=new Date().toISOString(); } if(next==='pending'){st.startedAt=null; st.completedAt=null;} st.status=next; }
+      st.notes=modal.querySelector(`[data-modal-stage-note="${sel.dataset.modalStageStatus}"]`)?.value||'';
+    });
+    const total=job.stages.length||1;
+    const done=job.stages.filter(s=>s.status==='completed').length;
+    const inprog=job.stages.some(s=>s.status==='in_progress');
+    if(done===total) job.status='Completed';
+    else if(done>0||inprog) job.status='In Progress';
+    else job.status='Pending';
+    job.updatedAt=new Date().toISOString();
+    save('Production stages updated',job.code||'');
+    modal.remove();
+    notify(t('Stages updated'),'success');
+  });
+}
+function showJobIssueModal(jobId){
+  const job=getJob(jobId); if(!job) return; ensureJobShape(job);
+  const metal=job.metalType||'Gold', purity=job.purity||'22K';
+  const modal=document.createElement('div'); modal.className='modal-overlay';
+  modal.innerHTML=`<div class="modal" style="max-width:520px"><div class="modal-header"><h3 class="modal-title">${t('Metal Issue')} · ${esc(job.code||'')}</h3><button class="modal-close" data-close-modal>×</button></div><div class="modal-body"><form id="jobIssueModalForm" class="form">${input('date','Date','date',new Date().toISOString().slice(0,10))}${input('voucher','Voucher No','text',generateMetalTxnNumber('ISSUE'))}${select('metal','Metal',METAL_TYPES,metal)}${input('purity','Purity','text',purity)}${input('weight','Weight (g)','number','','min="0.001" step="0.001" required')}${textarea('notes','Notes')}</form><div id="jobIssuePreview" class="calc-preview" style="margin-top:12px"></div></div><div class="modal-footer"><button class="btn btn-champagne" data-save-job-issue>${t('Record Issue')}</button><button class="btn btn-ghost" data-close-modal>${t('Cancel')}</button></div></div>`;
+  document.body.appendChild(modal);
+  const issueForm=modal.querySelector('#jobIssueModalForm');
+  restoreFormDraft(issueForm);
+  const updateIssuePreview=()=>{
+    const w=num(issueForm.querySelector('[name="weight"]')?.value);
+    const net=rnd(getJobIssuedWeight(job)+w-getJobReturnedWeight(job));
+    const out=modal.querySelector('#jobIssuePreview');
+    if(out) out.innerHTML=`${t('Weight')}: <strong>${w.toFixed(3)} g</strong> · ${t('Net outstanding after issue')}: <strong>${net.toFixed(3)} g</strong>`;
+  };
+  issueForm.addEventListener('input',updateIssuePreview);
+  updateIssuePreview();
+  modal.querySelectorAll('[data-close-modal]').forEach(b=>b.addEventListener('click',()=>modal.remove()));
+  modal.addEventListener('click',e=>{if(e.target===modal)modal.remove();});
+  modal.querySelector('[data-save-job-issue]').addEventListener('click',()=>{
+    const d=data(issueForm);
+    if(!(num(d.weight)>0)) return notify(t('Weight required'),'error');
+    addJobIssue(job,{date:d.date,voucher:d.voucher,metal:d.metal,purity:d.purity,weight:d.weight,notes:d.notes});
+    clearFormDraft('jobIssueModalForm');
+    modal.remove(); render(); notify(t('Metal issue recorded'),'success');
+  });
+}
+function showJobReturnModal(jobId){
+  const job=getJob(jobId); if(!job) return; ensureJobShape(job);
+  const metal=job.metalType||'Gold', purity=job.purity||'22K';
+  const modal=document.createElement('div'); modal.className='modal-overlay';
+  modal.innerHTML=`<div class="modal" style="max-width:520px"><div class="modal-header"><h3 class="modal-title">${t('Material Return')} · ${esc(job.code||'')}</h3><button class="modal-close" data-close-modal>×</button></div><div class="modal-body"><form id="jobReturnModalForm" class="form">${input('date','Date','date',new Date().toISOString().slice(0,10))}${input('voucher','Voucher No','text',generateMetalTxnNumber('RETURN'))}${select('type','Type',['RETURN','WASTAGE'],'RETURN')}${select('metal','Metal',METAL_TYPES,metal)}${input('purity','Purity','text',purity)}${input('weight','Weight (g)','number','','min="0.001" step="0.001" required')}${textarea('notes','Notes')}</form><div id="jobReturnPreview" class="calc-preview" style="margin-top:12px"></div></div><div class="modal-footer"><button class="btn btn-champagne" data-save-job-return>${t('Record Return')}</button><button class="btn btn-ghost" data-close-modal>${t('Cancel')}</button></div></div>`;
+  document.body.appendChild(modal);
+  const returnForm=modal.querySelector('#jobReturnModalForm');
+  restoreFormDraft(returnForm);
+  const updateReturnPreview=()=>{
+    const w=num(returnForm.querySelector('[name="weight"]')?.value);
+    const type=returnForm.querySelector('[name="type"]')?.value||'RETURN';
+    const net=rnd(getJobIssuedWeight(job)-getJobReturnedWeight(job)-w);
+    const wastage=num(job.wastageActual||0)+(type==='WASTAGE'?w:0);
+    const issued=getJobIssuedWeight(job);
+    const pct=issued>0?rnd(wastage/issued*100):0;
+    const out=modal.querySelector('#jobReturnPreview');
+    if(out) out.innerHTML=`${t('Weight')}: <strong>${w.toFixed(3)} g</strong> · ${t('Net outstanding after return')}: <strong>${net.toFixed(3)} g</strong> · ${t('Wastage')}: <strong>${wastage.toFixed(3)} g (${pct.toFixed(2)}%)</strong>`;
+  };
+  returnForm.addEventListener('input',updateReturnPreview);
+  returnForm.addEventListener('change',updateReturnPreview);
+  updateReturnPreview();
+  modal.querySelectorAll('[data-close-modal]').forEach(b=>b.addEventListener('click',()=>modal.remove()));
+  modal.addEventListener('click',e=>{if(e.target===modal)modal.remove();});
+  modal.querySelector('[data-save-job-return]').addEventListener('click',()=>{
+    const d=data(returnForm);
+    if(!(num(d.weight)>0)) return notify(t('Weight required'),'error');
+    addJobReturn(job,{date:d.date,voucher:d.voucher,type:d.type,metal:d.metal,purity:d.purity,weight:d.weight,notes:d.notes});
+    clearFormDraft('jobReturnModalForm');
+    modal.remove(); render(); notify(t('Material return recorded'),'success');
+  });
+}
+
 // Event handlers
-document.addEventListener('click',e=>{
+document.addEventListener('click',async e=>{
   const b=e.target.closest('[data-tab]');
-  if(b){tab=b.dataset.tab; sidebarOpen=false; render(); return;}
+  if(b){
+    const newTab = b.dataset.tab;
+    tab = newTab;
+    sidebarOpen=false;
+  // If the button also has data-action="new" for karigar, open the new karigar form
+  if(newTab === 'karigar' && (b.dataset.action === 'new' || e.target.closest('[data-action="new"]'))){
+    state.karigarEditId=''; state.karigarSelectedId=''; state.karigarView='new';
+  }
+  if(newTab === 'accounting' && b.dataset.action === 'newIncome'){
+    state.accountingView='newIncome';
+  }
+  if(newTab === 'accounting' && b.dataset.action === 'newExpense'){
+    state.accountingView='newExpense';
+  }
+  if(newTab === 'production' && (b.dataset.action === 'new' || e.target.closest('[data-action="new"]'))){
+    state.productionView='new';
+  }
+    if(newTab === 'inventory'){
+      setTimeout(() => loadItemDraft(), 0);
+    }
+    render(); return;
+  }
   if(e.target.closest('[data-acct-tab]')){acctUI.tab=e.target.closest('[data-acct-tab]').dataset.acctTab; render(); return;}
   if(e.target.closest('[data-acct-backfill]')){if(!acctCanPost()) return; if(!confirm(t('Post existing sales, expenses and valued metal transactions? Duplicate sources are skipped.'))) return; const res=backfill(state); save('Accounting backfill',`posted ${res.posted}, skipped ${res.skipped}`); alert(t('Posted')+': '+res.posted+' · '+t('Skipped')+': '+res.skipped+(res.errors.length?'\n'+res.errors.slice(0,5).join('\n'):'')); render(); return;}
   if(e.target.closest('[data-acct-reverse]')){if(!acctCanPost()) return; const id=e.target.closest('[data-acct-reverse]').dataset.acctReverse; if(confirm(t('Create a balanced reversal for this journal?'))){const r=reverseJournal(state,id); if(!r.ok) alert(t('Reversal failed')+': '+r.error); else save('Journal reversed',r.journal.no); render();} return;}
@@ -3444,12 +3942,15 @@ document.addEventListener('click',e=>{
   if(e.target.closest('[data-tax-rule-verify]')){if(!taxCanConfigure()) return; const id=e.target.closest('[data-tax-rule-verify]').dataset.taxRuleVerify; const url=prompt(t('Official source URL'),''); if(!url) return; const r=verifyTaxRule(state,id,url); if(!r.ok) return alert(t('Verification rejected')+': '+r.error); save('Tax rule verified',id); render(); return;}
   if(e.target.closest('[data-tax-rule-end]')){if(!taxCanConfigure()) return; const id=e.target.closest('[data-tax-rule-end]').dataset.taxRuleEnd; const date=prompt(t('End date')+' (YYYY-MM-DD)',taxToday()); if(!date) return; const r=endTaxRule(state,id,date); if(!r.ok) return alert(t('Rule rejected')+': '+r.error); save('Tax rule ended',id); render(); return;}
   if(e.target.closest('[data-kc-tab]')){kcUI.tab=e.target.closest('[data-kc-tab]').dataset.kcTab; kcUI.query=''; render(); return;}
+  if(e.target.closest('[data-settings-tab]')){state.settingsView=e.target.closest('[data-settings-tab]').dataset.settingsTab; render(); return;}
+  if(e.target.closest('[data-knowledge-tab]')){state.knowledgeTab=e.target.closest('[data-knowledge-tab]').dataset.knowledgeTab; render(); return;}
   if(e.target.closest('[data-kc-new]')){openKcEditor(e.target.closest('[data-kc-new]').dataset.kcNew,''); return;}
   if(e.target.closest('[data-kc-edit]')){const [name,id]=e.target.closest('[data-kc-edit]').dataset.kcEdit.split(':'); openKcEditor(name,id); return;}
   if(e.target.closest('[data-kc-del]')){const [name,id]=e.target.closest('[data-kc-del]').dataset.kcDel.split(':'); if(confirm(t('Delete this master record?'))){const ov={...(state.kcOverrides[name]||{})}; const base=KC_DATASETS[name].base.some(r=>r.id===id); if(base) ov[id]={...(ov[id]||{}),__deleted:true}; else delete ov[id]; state.kcOverrides[name]=ov; save('Master data deleted',''); render();} return;}
-  if(e.target.closest('[data-kc-save]')){const [name,id]=e.target.closest('[data-kc-save]').dataset.kcSave.split(':'); const raw=document.getElementById('kcEditJson')?.value||''; let rec; try{rec=JSON.parse(raw);}catch{return alert(t('Invalid JSON.'));} if(!rec || typeof rec!=='object' || !String(rec.id||'').trim()) return alert(t('Record ID is required.')); const ov={...(state.kcOverrides[name]||{})}; const key=String(rec.id).trim(); const isBase=KC_DATASETS[name].base.some(r=>r.id===key); ov[key]={...rec,id:key,__new:!isBase}; state.kcOverrides[name]=ov; document.querySelector('.modal-overlay')?.remove(); save('Master data updated',key); render(); return;}
+  if(e.target.closest('[data-kc-save]')){const [name,id]=e.target.closest('[data-kc-save]').dataset.kcSave.split(':'); const raw=document.getElementById('kcEditJson')?.value||''; let rec; try{rec=sanitizeObject(JSON.parse(raw));}catch{return alert(t('Invalid JSON.'));} if(!rec || typeof rec!=='object' || !String(rec.id||'').trim()) return alert(t('Record ID is required.')); const ov={...(state.kcOverrides[name]||{})}; const key=String(rec.id).trim(); const isBase=KC_DATASETS[name].base.some(r=>r.id===key); ov[key]={...rec,id:key,__new:!isBase}; state.kcOverrides[name]=ov; document.querySelector('.modal-overlay')?.remove(); save('Master data updated',key); render(); return;}
   if(e.target.closest('[data-confirm-toggle]')){const id=e.target.closest('[data-confirm-toggle]').dataset.confirmToggle; const done={...(state.settings.confirmations||{})}; if(done[id]) delete done[id]; else done[id]=true; state.settings.confirmations=done; save('Local confirmation updated',id); render(); return;}
   if(e.target.id==='sidebarToggle' || e.target.closest('#sidebarToggle')){sidebarOpen=!sidebarOpen; render(); return;}
+  if(e.target.id==='sidebarClose' || e.target.closest('#sidebarClose') || e.target.id==='sidebarBackdrop' || e.target.closest('#sidebarBackdrop')){sidebarOpen=false; render(); return;}
   if(e.target.id==='export' || e.target.closest('#export')){download('ratnaos-backup-'+new Date().toISOString().slice(0,10)+'.json',JSON.stringify(state,null,2),'application/json'); return;}
   // Auth logout
   if(e.target.closest('[data-rate-sync]')){ syncDailyRates({auto:false}); return; }
@@ -3474,25 +3975,25 @@ document.addEventListener('click',e=>{
   if(e.target.closest('[data-report-clear-filters]')){clearReportFilters(); render(); return;}
 
   // Inventory
-  if(e.target.closest('[data-cat]')){const btn=e.target.closest('[data-cat]'); document.getElementById('itemCategory').value=btn.dataset.cat; document.querySelectorAll('#itemTypeTabs .tab').forEach(t=>t.classList.toggle('active',t===btn)); toggleStoneSection(btn.dataset.cat); return;}
-  if(e.target.dataset.invAdd){resetItemForm(); const c=document.getElementById('itemCategory'); if(c)c.value='gold'; document.querySelectorAll('#itemTypeTabs .tab').forEach(t=>t.classList.toggle('active',t.dataset.cat==='gold')); toggleStoneSection('gold'); return;}
-  if(e.target.dataset.invCancel!==undefined || e.target.closest('[data-inv-cancel]')){resetItemForm(); return;}
-  if(e.target.dataset.invEdit){const item=state.items.find(i=>i.id===e.target.dataset.invEdit); if(item) populateItemForm(item); return;}
-  if(e.target.dataset.invDelete){if(confirm(t('Delete this item?'))){const idx=state.items.findIndex(i=>i.id===e.target.dataset.invDelete); if(idx>=0){state.items.splice(idx,1); save('Item deleted','');}} return;}
-  if(e.target.dataset.invExport || e.target.closest('[data-inv-export]')){exportInventoryCSV(); return;}
-  if(e.target.dataset.invSortDir!==undefined || e.target.closest('[data-inv-sort-dir]')){state.invSortDir=state.invSortDir==='asc'?'desc':'asc'; render(); return;}
+  if(e.target.closest('[data-cat]')){const btn=e.target.closest('[data-cat]'); const cat=btn.dataset.cat; document.getElementById('itemCategory').value=cat; document.querySelectorAll('#itemTypeTabs .tab').forEach(t=>t.classList.toggle('active',t===btn)); toggleStoneSection(cat); updateMetalTypeDropdown(cat); return;}
+  if(e.target.closest('[data-inv-add]')){resetItemForm(); const c=document.getElementById('itemCategory'); if(c)c.value='gold'; document.querySelectorAll('#itemTypeTabs .tab').forEach(t=>t.classList.toggle('active',t.dataset.cat==='gold')); toggleStoneSection('gold'); return;}
+  if(e.target.dataset.invCancel!==undefined || e.target.closest('[data-inv-cancel]')){resetItemForm(); notify(t('Edit cancelled'),'info'); return;}
+  if(e.target.dataset.invEdit){const item=state.items.find(i=>i.id===e.target.dataset.invEdit); if(item){render(); populateItemForm(item);} notify(t('Editing item'),'info'); return;}
+  if(e.target.dataset.invDelete){if(confirm(t('Delete this item?'))){const idx=state.items.findIndex(i=>i.id===e.target.dataset.invDelete); if(idx>=0){state.items.splice(idx,1); save('Item deleted',''); notify(t('Item deleted'),'success');}} return;}
+  if(e.target.dataset.invExport || e.target.closest('[data-inv-export]')){exportInventoryCSV(); notify(t('Inventory exported to CSV'),'success'); return;}
+  if(e.target.dataset.invSortDir!==undefined || e.target.closest('[data-inv-sort-dir]')){state.invSortDir=state.invSortDir==='asc'?'desc':'asc'; render(); notify(t('Sort order changed'),'info'); return;}
   if(e.target.dataset.addStone!==undefined || e.target.closest('[data-add-stone]')){addStoneRow(); return;}
   if(e.target.dataset.delStoneRow){e.target.closest('.stone-detail-row')?.remove(); updateCalculatedFields(); return;}
   if(e.target.dataset.addImages!==undefined || e.target.closest('[data-add-images]')){document.getElementById('itemImages')?.click(); return;}
-  if(e.target.dataset.removeImage!==undefined){const idx=parseInt(e.target.dataset.removeImage); const form=document.getElementById('itemForm'); const itemId=form?.dataset.editId; if(itemId){const item=state.items.find(i=>i.id===itemId); if(item&&item.images){item.images.splice(idx,1); item.updatedAt=new Date().toISOString(); save('Image removed',item.code); populateItemForm(item);}} return;}
+  if(e.target.dataset.removeImage!==undefined){const idx=parseInt(e.target.dataset.removeImage); const form=document.getElementById('itemForm'); const itemId=form?.dataset.editId; if(itemId){const item=state.items.find(i=>i.id===itemId); if(item&&item.images){item.images.splice(idx,1); item.updatedAt=new Date().toISOString(); save('Image removed',item.code); populateItemForm(item); notify(t('Image removed'),'success');}} return;}
 
   // POS
-  if(e.target.dataset.posAddItem){const item=state.items.find(i=>i.id===e.target.dataset.posAddItem); if(item&&item.status==='stock'){if(!state.posCart) state.posCart=[]; const ex=state.posCart.findIndex(c=>c.itemId===item.id); if(ex>=0) state.posCart[ex].qty+=1; else state.posCart.push(calcCartItem(item,1)); render();} else alert(t('Item not available')); return;}
-  if(e.target.dataset.posRemoveItem!==undefined){const idx=parseInt(e.target.dataset.posRemoveItem); if(state.posCart) state.posCart.splice(idx,1); render(); return;}
-  if(e.target.dataset.posClearCart!==undefined || e.target.closest('[data-pos-clear-cart]')){state.posCart=[]; render(); return;}
+  if(e.target.dataset.posAddItem){const item=state.items.find(i=>i.id===e.target.dataset.posAddItem); if(item&&item.status==='stock'){if(!state.posCart) state.posCart=[]; const ex=state.posCart.findIndex(c=>c.itemId===item.id); if(ex>=0) state.posCart[ex].qty+=1; else state.posCart.push(calcCartItem(item,1)); savePOSDraft(); render(); notify(t('Item added to cart'),'success');} else notify(t('Item not available'),'error'); return;}
+  if(e.target.dataset.posRemoveItem!==undefined){const idx=parseInt(e.target.dataset.posRemoveItem); if(state.posCart) state.posCart.splice(idx,1); savePOSDraft(); render(); return;}
+  if(e.target.dataset.posClearCart!==undefined || e.target.closest('[data-pos-clear-cart]')){state.posCart=[]; state.posExtraDiscount=0; clearPOSDraft(); render(); notify(t('Cart cleared'),'info'); return;}
   if(e.target.dataset.posAddPay!==undefined || e.target.closest('[data-pos-add-pay]')){const wrap=document.getElementById('posPaymentRows'); if(wrap){const total=calcCartTotals(state.posCart||[]).total; const paid=[...wrap.querySelectorAll('[name="payAmount"]')].reduce((s,el)=>s+num(el.value),0); const remaining=rnd(total-paid); wrap.insertAdjacentHTML('beforeend',`<div class="payment-row" style="display:flex;gap:8px;margin-bottom:8px"><select class="field-select" name="payMethod" style="flex:1">${PAYMENT_METHODS.map(m=>`<option value="${m}">${m}</option>`).join('')}</select><input class="field-input" name="payAmount" type="number" style="width:120px" min="0" step="0.01" value="${remaining.toFixed(2)}"><button type="button" class="btn btn-ghost btn-sm" data-pos-remove-pay>×</button></div>`); updatePaymentSummary();} return;}
   if(e.target.dataset.posRemovePay!==undefined || e.target.closest('[data-pos-remove-pay]')){e.target.closest('.payment-row')?.remove(); updatePaymentSummary(); return;}
-  if(e.target.dataset.posCheckout!==undefined || e.target.closest('[data-pos-checkout]')){completePOSale(); return;}
+  if(e.target.dataset.posCheckout!==undefined || e.target.closest('[data-pos-checkout]')){await completePOSale(); return;}
   if(e.target.dataset.posSaveQuote!==undefined || e.target.closest('[data-pos-save-quote]')){savePOSQuote(); return;}
   if(e.target.dataset.posViewInvoice){const sale=state.sales.find(s=>s.id===e.target.dataset.posViewInvoice); if(sale) showInvoiceModal(sale); return;}
   if(e.target.dataset.printInvoice){printInvoice(e.target.dataset.printInvoice); return;}
@@ -3501,19 +4002,33 @@ document.addEventListener('click',e=>{
 
   // Metals
   if(e.target.dataset.metalAdd!==undefined || e.target.closest('[data-metal-add]')){showMetalTxnModal(); return;}
-  if(e.target.dataset.metalEdit){const t=state.metalManagement.transactions.find(x=>x.id===e.target.dataset.metalEdit); if(t){if(!canEditTransaction(t)) return alert(t('Cannot edit posted transaction in closed period')); showMetalTxnModal(t);} return;}
-  if(e.target.dataset.metalDelete){const t=state.metalManagement.transactions.find(x=>x.id===e.target.dataset.metalDelete); if(t){if(!canEditTransaction(t)) return alert(t('Cannot delete posted transaction in closed period')); if(confirm(t('Delete this transaction?'))){state.metalManagement.transactions=state.metalManagement.transactions.filter(x=>x.id!==t.id); save('Metal transaction deleted', t.type+' '+t.metal+' '+t.purity);}} return;}
-  if(e.target.dataset.metalExport!==undefined || e.target.closest('[data-metal-export]')){exportMetalCSV(); return;}
-  if(e.target.dataset.metalSaveTxn!==undefined || e.target.closest('[data-metal-save-txn]')){saveMetalTxnFromModal(); return;}
-  if(e.target.dataset.metalPostPeriod!==undefined || e.target.closest('[data-metal-post-period]')){const period=new Date().toISOString().slice(0,7); if(confirm(t('Post period')+' '+period+'? '+t('Transactions in this month will be locked.'))){postPeriod(period); save('Period posted',period);} return;}
+  if(e.target.dataset.metalEdit){const t=state.metalManagement.transactions.find(x=>x.id===e.target.dataset.metalEdit); if(t){if(!canEditTransaction(t)) return notify(t('Cannot edit posted transaction in closed period'),'error'); showMetalTxnModal(t);} return;}
+  if(e.target.dataset.metalDelete){const t=state.metalManagement.transactions.find(x=>x.id===e.target.dataset.metalDelete); if(t){if(!canEditTransaction(t)) return notify(t('Cannot delete posted transaction in closed period'),'error'); if(confirm(t('Delete this transaction?'))){state.metalManagement.transactions=state.metalManagement.transactions.filter(x=>x.id!==t.id); save('Metal transaction deleted', t.type+' '+t.metal+' '+t.purity); notify(t('Transaction deleted'),'success');}} return;}
+  if(e.target.dataset.metalExport!==undefined || e.target.closest('[data-metal-export]')){exportMetalCSV(); notify(t('Metal transactions exported'),'success'); return;}
+  if(e.target.dataset.metalSaveTxn!==undefined || e.target.closest('[data-metal-save-txn]')){await saveMetalTxnFromModal(); return;}
+  if(e.target.dataset.metalPostPeriod!==undefined || e.target.closest('[data-metal-post-period]')){const period=new Date().toISOString().slice(0,7); if(confirm(t('Post period')+' '+period+'? '+t('Transactions in this month will be locked.'))){postPeriod(period); save('Period posted',period); notify(t('Period posted'),'success');} return;}
 
   // Karigar / Jobs
-  if(e.target.dataset.kNew!==undefined || e.target.closest('[data-k-new]')){state.karigarEditId=''; state.karigarSelectedId=''; render(); return;}
+  if(e.target.dataset.kNew!==undefined || e.target.closest('[data-k-new]') || e.target.dataset.action==='new' || e.target.closest('[data-action="new"]')){state.karigarEditId=''; state.karigarSelectedId=''; state.karigarView='new'; render(); notify(t('New karigar form opened'),'info'); return;}
   if(e.target.dataset.kSelect){state.karigarSelectedId=e.target.dataset.kSelect; render(); return;}
   if(e.target.dataset.kEdit){state.karigarEditId=e.target.dataset.kEdit; state.karigarSelectedId=e.target.dataset.kEdit; render(); return;}
   if(e.target.dataset.kCancelEdit!==undefined || e.target.closest('[data-k-cancel-edit]')){state.karigarEditId=''; render(); return;}
+  if(e.target.dataset.sNew!==undefined || e.target.closest('[data-supplier-new]')){state.supplierEditId=''; state.supplierView='new'; render(); notify(t('New supplier form opened'),'info'); return;}
+  if(e.target.dataset.sEdit){state.supplierEditId=e.target.dataset.sEdit; state.supplierView='edit'; render(); return;}
+  if(e.target.dataset.sCancelEdit!==undefined || e.target.closest('[data-supplier-cancel-edit]')){state.supplierEditId=''; state.supplierView='list'; render(); return;}
+  if(e.target.dataset.sLedger){state.supplierSelectedId=e.target.dataset.sLedger; state.supplierView='ledger'; render(); return;}
+  if(e.target.dataset.eNew!==undefined || e.target.closest('[data-expense-new]')){state.expenseEditId=''; state.expenseView='new'; render(); notify(t('New expense form opened'),'info'); return;}
+  if(e.target.dataset.eEdit){state.expenseEditId=e.target.dataset.eEdit; state.expenseView='edit'; render(); return;}
+  if(e.target.dataset.eCancelEdit!==undefined || e.target.closest('[data-expense-cancel-edit]')){state.expenseEditId=''; state.expenseView='list'; render(); return;}
+  if(e.target.dataset.eDelete){if(confirm(t('Delete this expense? This cannot be undone.'))){state.expenses=state.expenses.filter(x=>x.id!==e.target.dataset.eDelete); save('Expense deleted',''); render();} return;}
   if(e.target.dataset.jobSelect){state.karigarSelectedJobId=e.target.dataset.jobSelect; if(tab!=='karigar' && e.target.closest('[data-tab="karigar"]')){tab='karigar';} render(); setTimeout(()=>document.getElementById('jobDetail')?.scrollIntoView({behavior:'smooth',block:'start'}),50); return;}
-  if(e.target.dataset.jobPrint){const j=getJob(e.target.dataset.jobPrint); if(j) downloadJobCardPDF(j); return;}
+  if(e.target.dataset.jobPrint){const j=getJob(e.target.dataset.jobPrint); if(j) downloadJobCardPDF(j); notify(t('Job card downloaded'),'success'); return;}
+  if(e.target.dataset.jobDetail){state.productionView='detail'; state.productionViewId=e.target.dataset.jobDetail; render(); return;}
+  if(e.target.dataset.productionBack!==undefined || e.target.closest('[data-production-back]')){state.productionView='list'; render(); return;}
+  if(e.target.dataset.jobAddPhotos){document.getElementById('photos'+e.target.dataset.jobAddPhotos)?.click(); return;}
+  if(e.target.dataset.jobStage){showJobStageModal(e.target.dataset.jobStage); return;}
+  if(e.target.dataset.jobIssue){showJobIssueModal(e.target.dataset.jobIssue); return;}
+  if(e.target.dataset.jobReturn){showJobReturnModal(e.target.dataset.jobReturn); return;}
 
   // Production materials tabs
   if(e.target.closest('.tab[data-mat-tab]')){const btn=e.target.closest('.tab[data-mat-tab]'); document.querySelectorAll('.tabs .tab[data-mat-tab]').forEach(t=>t.classList.remove('active')); btn.classList.add('active'); document.querySelectorAll('.mat-tab-panel').forEach(p=>p.style.display='none'); const panel=document.getElementById('mat-'+btn.dataset.matTab); if(panel) panel.style.display='block'; return;}
@@ -3534,7 +4049,7 @@ document.addEventListener('change',async e=>{
     const code=e.target.value;
     state.settings=applyCountryPreset({...state.settings,country:code},code);
     setCountry(code);
-    try{ localStorage.setItem(KEY,JSON.stringify(state)); }catch(err){}
+    persistState();
     // Keep unsaved shop edits: refresh only the dependent fields and the profile card.
     const sync=(id,val)=>{ const el=document.getElementById(id); if(el) el.value=val; };
     sync('currency',state.settings.currency);
@@ -3548,7 +4063,7 @@ document.addEventListener('change',async e=>{
     return;
   }
   if(e.target.id==='itemImages') handleImageUpload(e.target.files);
-  if(e.target.dataset.posQty!==undefined){const idx=parseInt(e.target.dataset.posQty); const qty=parseInt(e.target.value)||1; if(state.posCart&&state.posCart[idx]){const c=state.posCart[idx]; c.qty=qty; c.subtotal=rnd(c.basePrice*qty); c.taxable=rnd(c.subtotal-c.discount); c.tax=calcTax(c.taxable); c.total=calcGross(c.taxable,c.tax); render();}}
+  if(e.target.dataset.posQty!==undefined){const idx=parseInt(e.target.dataset.posQty); const qty=Math.max(1,parseInt(e.target.value)||1); if(state.posCart&&state.posCart[idx]){state.posCart[idx].qty=qty; refreshPOSUI();} return;}
   if(e.target.matches('select[data-job-stage-status]')){const job=getJob(e.target.dataset.jobStageStatus); if(job){const stId=e.target.dataset.stageId; updateJobStage(job,stId,{status:e.target.value}); render(); state.karigarSelectedJobId=job.id;}}
   if(e.target.id==='posCustomerSelect'){const details=document.getElementById('posCustomerDetails'); const c=getCustomer(e.target.value); if(c&&details){details.style.display='block'; details.innerHTML=`<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><div><strong>Phone:</strong> ${esc(c.phone||'-')}</div><div><strong>Email:</strong> ${esc(c.email||'-')}</div><div><strong>GSTIN:</strong> ${esc(c.gstin||'-')}</div><div><strong>Balance:</strong> ${money(c.balance||0)}</div></div>`;} else if(details){details.style.display='none'; details.innerHTML='';}}
   if(e.target.id==='invFilterCategory'){state.invFilterCategory=e.target.value; render();}
@@ -3568,10 +4083,22 @@ document.addEventListener('change',async e=>{
         const dataUrl=await fileToDataUrl(file);
         addJobPhoto(job,dataUrl,file.name,'');
       }
+      render();;
+    }
+  }
+  if(e.target.matches('input[data-job-photos]')){
+    const job=getJob(e.target.dataset.jobPhotos); if(job && e.target.files?.length){
+      for(const file of Array.from(e.target.files).slice(0,8)){
+        const dataUrl=await fileToDataUrl(file);
+        addJobPhoto(job,dataUrl,file.name,'');
+      }
       render();
     }
   }
 });
+
+let searchRenderTimer=null;
+function scheduleRender(delay=120){ clearTimeout(searchRenderTimer); searchRenderTimer=setTimeout(()=>render(),delay); }
 
 document.addEventListener('input',e=>{
   if(e.target.id==='kcSearch'){const value=e.target.value; const pos=e.target.selectionStart; kcUI.query=value; render(); const el=document.getElementById('kcSearch'); if(el){el.focus(); try{el.setSelectionRange(pos,pos)}catch{}} return;}
@@ -3581,15 +4108,17 @@ document.addEventListener('input',e=>{
   if(e.target.id==='kcConvValue'){kcUI.value=e.target.value; const out=document.getElementById('kcConvResult'); if(out) out.innerHTML=kcConvertResult(); return;}
   if(e.target.id==='kcRingSize'){kcUI.ringSize=e.target.value; const out=document.getElementById('kcRingResult'); if(out) out.innerHTML=kcRingResultHTML(); return;}
   if(e.target.id==='acctVoucherSearch'){acctUI.voucherQuery=e.target.value; const card=e.target.closest('.card'); if(card){const list=voucherRegister(state).filter(j=>{const q=e.target.value.toLowerCase();return !q||[j.no,j.reference,j.memo,j.voucherType].join(' ').toLowerCase().includes(q);}); const body=card.querySelector('.table-wrap'); if(body) body.outerHTML=rows(['Number','Type','Date','Reference','Memo','Amount','Status',''],list.map(j=>`<tr><td class="mono">${esc(j.no)}</td><td>${esc(t(j.voucherType||'Journal'))}</td><td class="mono">${esc(j.date)}</td><td>${esc(j.reference||'')}</td><td class="small">${esc(j.memo||'')}</td><td class="mono align-right">${acctMoney(j.debit)}</td><td>${j.status==='reversed'?kcBadge(t('Reversed'),'badge-warn'):kcBadge(t('Posted'),'badge-completed')}</td><td></td></tr>`).join(''));} return;}
-  if(e.target.id==='invSearch'){state.invSearch=e.target.value; render();}
-  if(e.target.id==='metalSearch'){state.metalSearch=e.target.value; render();}
-  if(e.target.id==='posItemSearch'){state.posItemSearch=e.target.value; render();}
-  if(e.target.id==='karigarJobSearch'){state.karigarJobSearch=e.target.value; render();}
-  if(e.target.id==='posExtraDiscount'){
-    const pct=num(e.target.value); (state.posCart||[]).forEach(c=>{c.discount=calcDiscount(c.subtotal,pct); c.taxable=rnd(c.subtotal-c.discount); c.tax=calcTax(c.taxable); c.total=calcGross(c.taxable,c.tax);}); render();
-  }
-  if(e.target.name==='payAmount') updatePaymentSummary();
+  if(e.target.id==='invSearch'){state.invSearch=e.target.value; scheduleRender();}
+  if(e.target.id==='metalSearch'){state.metalSearch=e.target.value; scheduleRender();}
+  if(e.target.id==='posItemSearch'){state.posItemSearch=e.target.value; scheduleRender();}
+  if(e.target.id==='karigarJobSearch'){state.karigarJobSearch=e.target.value; scheduleRender();}
+  if(e.target.id==='posExtraDiscount'){ refreshPOSUI(); return; }
+  if(e.target.dataset.posQty!==undefined){ const idx=parseInt(e.target.dataset.posQty); const qty=Math.max(1,parseInt(e.target.value)||1); if(state.posCart&&state.posCart[idx]){ state.posCart[idx].qty=qty; refreshPOSUI(); } return; }
+  if(e.target.name==='payAmount'){ e.target.dataset.touched='1'; updatePaymentSummary(); return; }
+  if(e.target.closest('#metalTxnForm')){ updateMetalTxnPreview(); return; }
+  if(e.target.closest('#exchange')){ updateExchangePreview(); return; }
   if(['grossWeight','stoneWeight','netWeight','purity','makingCharge','wastagePercent','sellingPrice','metalType'].includes(e.target.name||e.target.id)) updateCalculatedFields();
+  if(e.target.closest('#stoneDetailsRows')) updateCalculatedFields();
   if(e.target.name==='wastagePercent'){const net=num(document.getElementById('netWeight')?.value); const wp=num(e.target.value); const ww=document.getElementById('wastageWeight'); if(ww) ww.value=rnd(net*wp/100).toFixed(3); updateCalculatedFields();}
   if(e.target.id==='cvVal'||e.target.id==='cvFrom'||e.target.id==='cvTo'){const val=num(document.getElementById('cvVal')?.value); const from=document.getElementById('cvFrom')?.value; const to=document.getElementById('cvTo')?.value; const res=convert(val,from,to); const out=document.getElementById('cvResult'); if(out) out.innerHTML=`${val} ${from} = <strong>${res.toFixed(4)} ${to}</strong>`;}
 });
@@ -3600,105 +4129,219 @@ document.addEventListener('blur',e=>{
   }
 },true);
 
-document.addEventListener('submit',e=>{
+document.addEventListener('submit',async e=>{
   e.preventDefault();
   const f=e.target, d=data(f);
+  const formId = f.getAttribute('id');
 
-  if(f.id==='rates'){if(num(d.gold)<=0||num(d.silver)<=0) return alert(t('Rates must be positive')); state.rates={gold:num(d.gold),silver:num(d.silver)}; save('Rates updated','Gold and silver rates'); return;}
-  if(f.id==='posRates'){if(num(d.gold)<=0||num(d.silver)<=0) return alert(t('Rates must be positive')); state.rates={gold:num(d.gold),silver:num(d.silver)}; (state.posCart||[]).forEach(c=>{const item=state.items.find(i=>i.id===c.itemId); if(item){const nc=calcCartItem(item,c.qty); Object.assign(c,nc,{discount:c.discount||0}); c.taxable=rnd(c.subtotal-c.discount); c.tax=calcTax(c.taxable); c.total=calcGross(c.taxable,c.tax);}}); save('POS Rates updated','Gold and silver rates'); return;}
+  if(formId==='rates'){if(num(d.gold)<=0||num(d.silver)<=0) return notify(t('Rates must be positive'),'error'); state.rates={gold:num(d.gold),silver:num(d.silver)}; save('Rates updated','Gold and silver rates'); notify(t('Rates updated successfully'),'success'); return;}
+  if(formId==='posRates'){if(num(d.gold)<=0||num(d.silver)<=0) return notify(t('Rates must be positive'),'error'); state.rates={gold:num(d.gold),silver:num(d.silver)}; (state.posCart||[]).forEach(c=>{const item=state.items.find(i=>i.id===c.itemId); if(item){const nc=calcCartItem(item,c.qty); Object.assign(c,nc,{discount:c.discount||0}); c.taxable=rnd(c.subtotal-c.discount); c.tax=calcTax(c.taxable); c.total=calcGross(c.taxable,c.tax);}}); save('POS Rates updated','Gold and silver rates'); notify(t('POS rates updated successfully'),'success'); return;}
 
-  if(f.id==='itemForm'){
-    const editId=f.dataset.editId; const category=d.category||'gold'; const metalType=d.metalType||'Gold'; const purityRaw=String(d.purity||'22K'); const purity=num(purityRaw.replace('K','').replace('PT',''))||22;
-    const grossWeight=num(d.grossWeight), stoneWeight=num(d.stoneWeight), netWeight=rnd(grossWeight-stoneWeight); const makingCharge=num(d.makingCharge), wastagePercent=num(d.wastagePercent), sellingPrice=num(d.sellingPrice);
-    const stoneDetails=[]; document.querySelectorAll('#stoneDetailsRows .stone-detail-row').forEach(row=>{const idx=row.dataset.idx; const type=row.querySelector(`[name="stoneType_${idx}"]`)?.value; const qty=num(row.querySelector(`[name="stoneQty_${idx}"]`)?.value); const weight=num(row.querySelector(`[name="stoneWt_${idx}"]`)?.value); const unit=row.querySelector(`[name="stoneUnit_${idx}"]`)?.value; const rate=num(row.querySelector(`[name="stoneRate_${idx}"]`)?.value); const setting=num(row.querySelector(`[name="stoneSetting_${idx}"]`)?.value); if(type&&weight>0) stoneDetails.push({type,qty,weight,unit,rate,setting});});
-    const images=[]; document.querySelectorAll('#imagePreview img').forEach(img=>images.push({data:img.src,alt:img.alt||''}));
-    const sku=d.sku||generateSKU(category,metalType,purityRaw); const barcode=d.barcode||generateBarcode(sku);
-    const tempItem={netWeight,purity,makingCharge,wastagePercent,stoneWeight,stoneDetails,metalType}; const costPrice=calcItem.totalCost(tempItem); const sell=sellingPrice||rnd(costPrice*1.25);
-    const qrCode=generateQRData({sku,name:d.name,metalType,purity:purityRaw,grossWeight,netWeight,stoneWeight,sellingPrice:sell,currency:state.settings.currency});
-    const itemData={id:editId||id(),code:(d.code||'').trim()||sku,sku,name:(d.name||'').trim(),category,metalType,purity,grossWeight,netWeight,stoneWeight,makingCharge,wastagePercent,wastageWeight:rnd(netWeight*wastagePercent/100),costPrice,sellingPrice:sell,marginPercent:rnd(sell?((sell-costPrice)/sell*100):0),status:d.status||'stock',location:d.location||'Showcase',tags:String(d.tags||'').split(',').map(s=>s.trim()).filter(Boolean),images,stoneDetails,barcode,qrCode,createdAt:editId?(state.items.find(i=>i.id===editId)?.createdAt||new Date().toISOString()):new Date().toISOString(),updatedAt:new Date().toISOString(),schemaVersion:2};
-    if(!itemData.code||!itemData.name) return alert(t('Code and name required'));
-    if(editId){const idx=state.items.findIndex(i=>i.id===editId); if(idx>=0){const old=state.items[idx].status; state.items[idx]=itemData; if(old!==itemData.status) recordMovement(itemData.id,'ADJUSTMENT','Status Change',1,0,'',`${old} -> ${itemData.status}`); save('Item updated',itemData.code);} }
-    else {if(state.items.some(i=>i.code.toLowerCase()===itemData.code.toLowerCase())) return alert(t('Item code exists')); state.items.unshift(itemData); recordMovement(itemData.id,'IN','Initial Stock',1,itemData.netWeight,'','Initial inventory entry'); save('Inventory item added',itemData.code);} 
-    resetItemForm(); return;
-  }
+  if(formId==='itemForm'){
+    const idempotencyKey = `item_save:${d.code||'new'}:${new Date().toISOString().slice(0,10)}`;
+    if (window.RatnaOS?.idempotencyHas?.(idempotencyKey)) {
+      notify(t('Item already saved.'), 'info');
+      return;
+    }
 
-  if(f.id==='exchange'){
-    const weight=num(d.weight), purity=num(d.purity), rate=num(d.rate), deduction=num(d.deduction);
-    if(!(weight>0)||rate<=0||deduction<0) return alert(t('Check assessment values'));
-    state.exchanges.unshift({id:id(),customer:d.customer,weight,purity,rate,deduction,value:rnd(weight*purity/24*rate-deduction),notes:d.notes,date:new Date().toISOString()});
-    save('Old gold received',d.customer); return;
-  }
+    // CSRF protection for state-changing inventory operation
+    if(window.RatnaOS?.csrf?.validate?.(window.RatnaOS.csrf.token()) === false){
+      notify(t('Session validation failed. Please refresh and try again.'), 'error');
+      return;
+    }
 
-  if(f.id==='rateSyncForm'){
-    const cfg=rateSyncSettings();
-    state.settings.rateSync={...cfg,enabled:d.rateSyncEnabled==='yes',url:(d.rateSyncUrl||'').trim(),goldPath:(d.rateSyncGoldPath||'gold').trim(),silverPath:(d.rateSyncSilverPath||'silver').trim(),unit:d.rateSyncUnit||'tola'};
-    save('Rate sync settings saved',state.settings.rateSync.url||'disabled');
+    // Permission check: inventory:create required
+    if(!window.RatnaOS?.auth?.hasPermission?.('inventory:create')){
+      notify(t('Insufficient permissions to create inventory items'), 'error');
+      return;
+    }
+
+    if(!window.RatnaOS?.atomicOperation){
+      await window.RatnaOS.ready;
+    }
+
+    try {
+      const result = await window.RatnaOS.atomicOperation(idempotencyKey, async () => {
+      const editId=f.dataset.editId; const category=d.category||'gold'; const metalType=d.metalType||'Gold'; const purityRaw=String(d.purity||'22K'); const purity=num(purityRaw.replace('K','').replace('PT',''))||22;
+      const grossWeight=num(d.grossWeight), stoneWeight=num(d.stoneWeight), netWeight=rnd(grossWeight-stoneWeight); const makingCharge=num(d.makingCharge), wastagePercent=num(d.wastagePercent), sellingPrice=num(d.sellingPrice);
+      const stoneDetails=[]; document.querySelectorAll('#stoneDetailsRows .stone-detail-row').forEach(row=>{const idx=row.dataset.idx; const type=row.querySelector(`[name="stoneType_${idx}"]`)?.value; const qty=num(row.querySelector(`[name="stoneQty_${idx}"]`)?.value); const weight=num(row.querySelector(`[name="stoneWt_${idx}"]`)?.value); const unit=row.querySelector(`[name="stoneUnit_${idx}"]`)?.value; const rate=num(row.querySelector(`[name="stoneRate_${idx}"]`)?.value); const setting=num(row.querySelector(`[name="stoneSetting_${idx}"]`)?.value); if(type&&weight>0) stoneDetails.push({type,qty,weight,unit,rate,setting});});
+      const images=[]; document.querySelectorAll('#imagePreview img').forEach(img=>images.push({data:img.src,alt:img.alt||''}));
+      const sku=d.sku||generateSKU(category,metalType,purityRaw); const barcode=d.barcode||generateBarcode(sku);
+      const tempItem={netWeight,purity,makingCharge,wastagePercent,stoneWeight,stoneDetails,metalType}; const costPrice=calcItem.totalCost(tempItem); const sell=sellingPrice||rnd(costPrice*1.25);
+      const qrCode=generateQRData({sku,name:d.name,metalType,purity:purityRaw,grossWeight,netWeight,stoneWeight,sellingPrice:sell,currency:state.settings.currency});
+      const itemData={id:editId||id(),code:(d.code||'').trim()||sku,sku,name:(d.name||'').trim(),category,metalType,purity,grossWeight,netWeight,stoneWeight,makingCharge,wastagePercent,wastageWeight:rnd(netWeight*wastagePercent/100),costPrice,sellingPrice:sell,marginPercent:rnd(sell?((sell-costPrice)/sell*100):0),status:d.status||'stock',location:d.location||'Showcase',tags:String(d.tags||'').split(',').map(s=>s.trim()).filter(Boolean),images,stoneDetails,barcode,qrCode,createdAt:editId?(state.items.find(i=>i.id===editId)?.createdAt||new Date().toISOString()):new Date().toISOString(),updatedAt:new Date().toISOString(),schemaVersion:2};
+      if(!itemData.name) throw new Error(t('Item name is required'));
+      if(!itemData.code) throw new Error(t('Item code is required'));
+      if(!(itemData.grossWeight>0)) throw new Error(t('Gross weight must be greater than zero'));
+      if(editId){
+        const idx=state.items.findIndex(i=>i.id===editId);
+        if(idx>=0){
+          const old=state.items[idx].status;
+          state.items[idx]=itemData;
+          if(old!==itemData.status) recordMovement(itemData.id,'ADJUSTMENT','Status Change',1,0,'',`${old} -> ${itemData.status}`);
+          save('Item updated',itemData.code);
+          return { success: true, message: t('Item updated successfully'), type: 'success' };
+        }
+      } else {
+        if(state.items.some(i=>i.code.toLowerCase()===itemData.code.toLowerCase())) throw new Error(t('Item code exists'));
+        state.items.unshift(itemData);
+        recordMovement(itemData.id,'IN','Initial Stock',1,itemData.netWeight,'','Initial inventory entry');
+        save('Inventory item added',itemData.code);
+        return { success: true, message: t('Item added successfully'), type: 'success' };
+      }
+      throw new Error(t('Item save failed'));
+    });
+      if (result && result.success) {
+        resetItemForm();
+        notify(result.message, result.type || 'success');
+      } else if (result) {
+        notify(result.error || result.message || t('Inventory save failed'), 'error');
+      }
+    } catch (err) {
+      console.error('[itemForm] Error:', err);
+      notify(err.message || t('Inventory save failed'), 'error');
+    }
     return;
   }
-  if(f.id==='settings'){
+
+if(formId==='exchange'){
+    const weight=num(d.weight), purity=num(d.purity), rate=num(d.rate), deduction=num(d.deduction);
+    if(!(weight>0)||rate<=0||deduction<0) return notify(t('Check assessment values'),'error');
+    state.exchanges.unshift({id:id(),customer:d.customer,weight,purity,rate,deduction,value:rnd(weight*purity/24*rate-deduction),notes:d.notes,date:new Date().toISOString()});
+    clearFormDraft('exchange');
+    save('Old gold received',d.customer); notify(t('Old gold receipt recorded'),'success'); return;
+  }
+
+  if(formId==='metalTxnForm'){
+    const weight=num(d.metalWeight);
+    if(!(weight>0)) return notify(t('Weight required'),'error');
+    const metal=d.metalType||'Gold';
+    const purity=d.metalPurity;
+    const unit=d.metalUnit||'gram';
+    const weightInGrams=toGram(weight,unit);
+    const rate=num(d.metalRate);
+    const value=num(d.metalValue)||rnd(weightInGrams*rate);
+    const payload={type:d.metalTxnType,metal,purity,unit,weight:weightInGrams,rate,value,adjustment:0,reference:d.metalReference||generateMetalTxnNumber(d.metalTxnType),notes:d.metalNotes,karigar:d.metalKarigar,jobCode:'',customer:'',date:d.metalDate,posted:true};
+    try {
+      await recordMetalTxn(payload);
+      clearFormDraft('metalTxnForm');
+      notify(t('Metal transaction recorded'),'success');
+    } catch (err) {
+      notify(err.message || t('Metal transaction failed'),'error');
+      return;
+    }
+    return;
+  }
+
+  if(formId==='rateSyncForm'){
+    const cfg=rateSyncSettings();
+    state.settings.rateSync={...cfg,enabled:d.rateSyncEnabled==='yes',url:(d.rateSyncUrl||'').trim(),goldPath:(d.rateSyncGoldPath||'gold').trim(),silverPath:(d.rateSyncSilverPath||'silver').trim(),unit:d.rateSyncUnit||'tola'};
+    save('Rate sync settings saved',state.settings.rateSync.url||'disabled'); notify(t('Rate sync settings saved'),'success');
+    return;
+  }
+  if(formId==='settings'){
     const nextLang=d.language||state.settings.language||'en';
     const nextCountry=d.country||state.settings.country||'NP';
     if(nextCountry!==state.settings.country) state.settings=applyCountryPreset({...state.settings,country:nextCountry},nextCountry);
     state.settings={...state.settings,shop:(d.shop||'').trim(),language:nextLang,country:nextCountry,currency:(d.currency||'NPR').trim().toUpperCase(),taxRate:num(d.taxRate),taxLabel:(d.taxLabel||'VAT').trim(),weightUnit:d.weightUnit||state.settings.weightUnit||'gram',taxInclusive:d.taxInclusive!=='no',invoicePrefix:(d.invoicePrefix||'INV').trim(),dial:(d.dial||'').trim(),vatNumber:(d.vatNumber||'').trim(),calendar:d.calendar||state.settings.calendar||'ad'};
     setLanguage(nextLang); setCountry(nextCountry);
-    save('Settings updated',d.shop||''); return;}
+    save('Settings updated',d.shop||''); notify(t('Settings saved successfully'),'success'); return;}
 
-  if(f.id==='matMetal'){const existing=state.materials.metals.findIndex(m=>m.purity===d.purity); const rec={purity:d.purity,rate:num(d.rate),stock:num(d.stock)}; if(existing>=0) state.materials.metals[existing]=rec; else state.materials.metals.unshift(rec); save('Metal rate updated',d.purity); render(); return;}
-  if(f.id==='matStone'){const existing=state.materials.gemstones.findIndex(m=>m.type===d.type); const rec={type:d.type,rate:num(d.rate),stock:num(d.stock),cert:d.cert}; if(existing>=0) state.materials.gemstones[existing]=rec; else state.materials.gemstones.unshift(rec); save('Stone rate updated',d.type); render(); return;}
-  if(f.id==='matCons'){const existing=state.materials.consumables.findIndex(m=>m.name===d.name); const rec={name:d.name,unit:d.unit,rate:num(d.rate),stock:num(d.stock)}; if(existing>=0) state.materials.consumables[existing]=rec; else state.materials.consumables.unshift(rec); save('Consumable updated',d.name); render(); return;}
+  if(formId==='matMetal'){const existing=state.materials.metals.findIndex(m=>m.purity===d.purity); const rec={purity:d.purity,rate:num(d.rate),stock:num(d.stock)}; if(existing>=0) state.materials.metals[existing]=rec; else state.materials.metals.unshift(rec); save('Metal rate updated',d.purity); render(); notify(t('Metal rate saved'),'success'); return;}
+  if(formId==='matStone'){const existing=state.materials.gemstones.findIndex(m=>m.type===d.type); const rec={type:d.type,rate:num(d.rate),stock:num(d.stock),cert:d.cert}; if(existing>=0) state.materials.gemstones[existing]=rec; else state.materials.gemstones.unshift(rec); save('Stone rate updated',d.type); render(); notify(t('Stone rate saved'),'success'); return;}
+  if(formId==='matCons'){const existing=state.materials.consumables.findIndex(m=>m.name===d.name); const rec={name:d.name,unit:d.unit,rate:num(d.rate),stock:num(d.stock)}; if(existing>=0) state.materials.consumables[existing]=rec; else state.materials.consumables.unshift(rec); save('Consumable updated',d.name); render(); notify(t('Consumable saved'),'success'); return;}
 
-  if(f.id==='bom'){
+  if(formId==='bom'){
     const stones=[]; document.querySelectorAll('#bomStones .stone-row').forEach(row=>{const idx=row.dataset.idx; const type=row.querySelector(`[name="stoneType_${idx}"]`)?.value; const qty=num(row.querySelector(`[name="stoneQty_${idx}"]`)?.value); const wt=num(row.querySelector(`[name="stoneWt_${idx}"]`)?.value); const unit=row.querySelector(`[name="stoneUnit_${idx}"]`)?.value; const rate=num(row.querySelector(`[name="stoneRate_${idx}"]`)?.value); const setting=num(row.querySelector(`[name="stoneSetting_${idx}"]`)?.value); if(type&&wt>0) stones.push({type,qty,weight:wt,unit,rate,setting});});
     let mtype=d.bomMakingType||'Per Gram'; const making={type:mtype.replace(/\s+/g,''),rate:num(d.bomMakingRate)}; if(making.type==='PerGram') making.type='perGram'; else if(making.type==='PerTola') making.type='perTola'; else if(making.type==='FlatRate') making.type='flat'; else if(making.type==='%ofMetalValue') making.type='pctMetal'; else if(making.type==='TieredbyProcess'){making.type='tiered'; making.tiers={}; ['Casting','Stone Setting','Engraving/Meenakari','Polishing','Rhodium Plating'].forEach(p=>{const v=num(d['bomTier_'+p]); if(v>0) making.tiers[p]=v;});}
     const bom={id:id(),code:d.bomCode,name:d.bomName,metal:{type:d.bomMetal,purity:d.bomPurity,grossWeight:num(d.bomGross),grossUnit:d.bomGrossUnit,stoneWeight:num(d.bomStoneW),stoneUnit:d.bomStoneUnit},wastagePct:num(d.bomWastage),making,stones,hallmark:num(d.bomHallmark),overhead:num(d.bomOverhead)};
-    const ex=state.boms.findIndex(b=>b.code===d.bomCode); if(ex>=0) state.boms[ex]=bom; else state.boms.unshift(bom); save('BOM saved',d.bomCode); render(); return;
+    const ex=state.boms.findIndex(b=>b.code===d.bomCode); if(ex>=0) state.boms[ex]=bom; else state.boms.unshift(bom); save('BOM saved',d.bomCode); render(); notify(t('BOM saved successfully'),'success'); return;
   }
-  if(f.id==='pricing'){const bomId=f.dataset.bom; const b=state.boms.find(x=>x.id===bomId); if(b){const gross=toGram(b.metal?.grossWeight,b.metal?.grossUnit||'gram'); const stoneW=toGram(b.metal?.stoneWeight,b.metal?.stoneUnit||'gram'); const net=rnd(Math.max(0,gross-stoneW)); const rate=(String(b.metal?.purity||'').includes('Silver'))?num(state.rates.silver):num(state.rates.gold); const metalCost=rnd(net*rate); const wastage=rnd(net*num(b.wastagePct)/100*rate); const making=b.making?.type==='perGram'?rnd(net*num(b.making.rate)):b.making?.type==='flat'?num(b.making.rate):0; const stones=(b.stones||[]).reduce((s,st)=>s+rnd(toGram(st.weight,st.unit||'carat')*num(st.rate)+num(st.setting)),0); const total=rnd(metalCost+wastage+making+stones+num(b.hallmark)+num(b.overhead)); const markup=num(d.markup); const selling=rnd(total*(1+markup/100)); const margin=rnd(selling?((selling-total)/selling*100):0); const out=document.getElementById('priceResult'); if(out) out.innerHTML=`<b>Suggested Selling: ${money(selling)}</b><br>Cost: ${money(total)} · Markup ${markup}% · Margin ${margin}%`; } return;}
+  if(formId==='pricing'){const bomId=f.dataset.bom; const b=state.boms.find(x=>x.id===bomId); if(b){const gross=toGram(b.metal?.grossWeight,b.metal?.grossUnit||'gram'); const stoneW=toGram(b.metal?.stoneWeight,b.metal?.stoneUnit||'gram'); const net=rnd(Math.max(0,gross-stoneW)); const rate=(String(b.metal?.purity||'').includes('Silver'))?num(state.rates.silver):num(state.rates.gold); const metalCost=rnd(net*rate); const wastage=rnd(net*num(b.wastagePct)/100*rate); const making=b.making?.type==='perGram'?rnd(net*num(b.making.rate)):b.making?.type==='flat'?num(b.making.rate):0; const stones=(b.stones||[]).reduce((s,st)=>s+rnd(toGram(st.weight,st.unit||'carat')*num(st.rate)+num(st.setting)),0); const total=rnd(metalCost+wastage+making+stones+num(b.hallmark)+num(b.overhead)); const markup=num(d.markup); const selling=rnd(total*(1+markup/100)); const margin=rnd(selling?((selling-total)/selling*100):0); const out=document.getElementById('priceResult'); if(out) out.innerHTML=`<b>Suggested Selling: ${money(selling)}</b><br>Cost: ${money(total)} · Markup ${markup}% · Margin ${margin}%`; } return;}
 
   // Karigar & Jobs
-  if(f.id==='karigarForm'){
+  if(formId==='karigarForm'){
     const editId=f.dataset.editId; const specialties=String(d.specialties||'').split(',').map(s=>s.trim()).filter(Boolean);
-    if(editId){const k=getKarigar(editId); if(!k) return; Object.assign(k,{name:d.name||'',phone:d.phone||'',address:d.address||'',status:d.status||'active',ratePerGram:num(d.ratePerGram),ratePerTola:num(d.ratePerTola),specialties,updatedAt:new Date().toISOString()}); updateKarigarStats(k.id); save('Karigar updated',k.name);} 
-    else {const k={id:id(),name:d.name||'',phone:d.phone||'',address:d.address||'',status:d.status||'active',ratePerGram:num(d.ratePerGram),ratePerTola:num(d.ratePerTola),specialties,totalJobs:0,totalWeightIssued:0,totalWeightReturned:0,totalWastage:0,totalLabourEarned:0,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),schemaVersion:1}; state.karigars.unshift(k); save('Karigar added',k.name);} 
-    state.karigarEditId=''; return;
+    if(!(d.name||'').trim()) return notify(t('Karigar name required'),'error');
+    if(editId){const k=getKarigar(editId); if(!k) return; Object.assign(k,{name:d.name||'',phone:d.phone||'',address:d.address||'',status:d.status||'active',ratePerGram:num(d.ratePerGram),ratePerTola:num(d.ratePerTola),specialties,updatedAt:new Date().toISOString()}); updateKarigarStats(k.id); save('Karigar updated',k.name); notify(t('Karigar updated successfully'),'success');} 
+    else {const k={id:id(),name:d.name||'',phone:d.phone||'',address:d.address||'',status:d.status||'active',ratePerGram:num(d.ratePerGram),ratePerTola:num(d.ratePerTola),specialties,totalJobs:0,totalWeightIssued:0,totalWeightReturned:0,totalWastage:0,totalLabourEarned:0,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),schemaVersion:1}; state.karigars.unshift(k); state.karigarEditId=''; state.karigarView='list'; save('Karigar added',k.name); notify(t('Karigar added successfully'),'success');}
+    clearFormDraft('karigarForm');
+    return;
   }
-  if(f.id==='jobCreateForm'){
-    if(!(d.description||'').trim()) return alert(t('Work description required'));
+  if(formId==='supplierForm'){
+    const editId=f.dataset.editId;
+    if(!(d.name||'').trim()) return notify(t('Supplier name required'),'error');
+    if(editId){const s=getSupplier(editId); if(!s) return; Object.assign(s,{name:d.name||'',contactPerson:d.contactPerson||'',phone:d.phone||'',address:d.address||'',paymentTerms:d.paymentTerms||'',updatedAt:new Date().toISOString()}); save('Supplier updated',s.name); notify(t('Supplier updated successfully'),'success');}
+    else {const s={id:id(),name:d.name||'',contactPerson:d.contactPerson||'',phone:d.phone||'',address:d.address||'',paymentTerms:d.paymentTerms||'',totalPurchases:0,totalAmount:0,balance:0,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),schemaVersion:1}; state.suppliers.unshift(s); save('Supplier added',s.name); notify(t('Supplier added successfully'),'success');}
+    state.supplierEditId=''; state.supplierView='list'; return;
+  }
+  if(formId==='incomeForm'){
+    const d=data(f);
+    if(!(d.amount||0)>0) return notify(t('Amount must be greater than zero'),'error');
+    const e={id:id(),reference:d.reference||'INC-'+Date.now().toString(36),date:d.date||new Date().toISOString().slice(0,10),category:d.category||'Sales',amount:num(d.amount),paymentMethod:d.paymentMethod||'Cash',notes:d.notes||'',type:'income',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),schemaVersion:1};
+    state.accounting=state.accounting||{income:[],expenses:[]};
+    state.accounting.income.unshift(e);
+    save('Income added',e.reference||e.id);
+    notify(t('Income added successfully'),'success');
+    state.accountingView='list'; render(); return;
+  }
+  if(formId==='expenseForm'){
+    const editId=f.dataset.editId;
+    if(!(d.amount||0)>0) return notify(t('Amount must be greater than zero'),'error');
+    if(editId){const e=getExpense(editId); if(!e) return; Object.assign(e,{reference:d.reference||'',date:d.date||'',category:d.category||'General',amount:num(d.amount),paymentMethod:d.paymentMethod||'Cash',status:d.status||'paid',notes:d.notes||'',updatedAt:new Date().toISOString()}); save('Expense updated',e.reference||e.id); notify(t('Expense updated successfully'),'success');}
+    else {const e={id:id(),reference:d.reference||generateExpenseNumber(),date:d.date||new Date().toISOString().slice(0,10),category:d.category||'General',amount:num(d.amount),paymentMethod:d.paymentMethod||'Cash',status:d.status||'paid',notes:d.notes||'',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),schemaVersion:1}; state.expenses=state.expenses||[]; state.expenses.unshift(e); save('Expense added',e.reference||e.id); notify(t('Expense added successfully'),'success');}
+    state.expenseEditId=''; state.expenseView='list'; render(); return;
+  }
+  if(formId==='jobForm'){
+    const item=state.items.find(i=>i.id===d.itemId);
+    const job=createJob({assignedKarigarId:d.assignedKarigarId,name:item?.name||'Job',description:d.notes||item?.name||'',deadline:d.targetDate||'',notes:d.notes||''});
+    job.itemId=d.itemId||''; job.targetDate=d.targetDate||'';
+    localStorage.setItem(KEY,JSON.stringify(state));
+    clearFormDraft('jobForm');
+    state.productionView='list'; tab='production'; render(); notify(t('Job created successfully'),'success'); return;
+  }
+  if(formId==='jobCreateForm'){
+    if(!(d.description||'').trim()) return notify(t('Work description required'),'error');
     const job=createJob({code:d.code,description:d.description,assignedKarigarId:d.assignedKarigarId,priority:d.priority,deadline:d.deadline,metalType:d.metalType,purity:d.purity,wastageAllowed:d.wastageAllowed,labourMethod:d.labourMethod,labourRate:d.labourRate,notes:d.notes});
-    state.karigarSelectedJobId=job.id; tab='karigar'; render(); return;
+    clearFormDraft('jobCreateForm');
+    state.karigarSelectedJobId=job.id; tab='karigar'; render(); notify(t('Job created successfully'),'success'); return;
   }
-  if(f.id==='jobUpdateForm'){
+  if(formId==='jobUpdateForm'){
     const job=getJob(f.dataset.jobId); if(!job) return; ensureJobShape(job);
     job.assignedKarigarId=d.assignedKarigarId||null; syncJobKarigar(job);
     const prevStatus=job.status; job.status=d.status||job.status; if(job.status==='In Progress'&&!job.startedAt) job.startedAt=new Date().toISOString(); if(job.status==='Completed') job.completedAt=new Date().toISOString();
     job.deadline=d.deadline||''; job.due=job.deadline; job.priority=d.priority||job.priority; job.metalType=d.metalType||job.metalType; job.purity=d.purity||job.purity; job.wastageAllowed=num(d.wastageAllowed);
     job.labourCharges={...(job.labourCharges||{}),method:d.labourMethod||'perGram',rate:num(d.labourRate)};
     recalcJobFinancials(job); if(job.assignedKarigarId) updateKarigarStats(job.assignedKarigarId);
-    job.updatedAt=new Date().toISOString(); save('Job updated', `${job.code}: ${prevStatus} → ${job.status}`); return;
+    job.updatedAt=new Date().toISOString(); clearFormDraft('jobUpdateForm'); save('Job updated', `${job.code}: ${prevStatus} → ${job.status}`); notify(t('Job updated successfully'),'success'); return;
   }
-  if(f.id==='jobIssueForm'){
-    const job=getJob(f.dataset.jobId); if(!job) return; if(!(num(d.weight)>0)) return alert(t('Weight required'));
-    addJobIssue(job,{date:d.date,voucher:d.voucher,metal:d.metal,purity:d.purity,weight:d.weight,notes:d.notes}); render(); return;
+  if(formId==='jobIssueForm'){
+    const job=getJob(f.dataset.jobId); if(!job) return; if(!(num(d.weight)>0)) return notify(t('Weight required'),'error');
+    clearFormDraft('jobIssueForm');
+    addJobIssue(job,{date:d.date,voucher:d.voucher,metal:d.metal,purity:d.purity,weight:d.weight,notes:d.notes}); render(); notify(t('Metal issue recorded'),'success'); return;
   }
-  if(f.id==='jobReturnForm'){
-    const job=getJob(f.dataset.jobId); if(!job) return; if(!(num(d.weight)>0)) return alert(t('Weight required'));
-    addJobReturn(job,{date:d.date,voucher:d.voucher,type:d.type,metal:d.metal,purity:d.purity,weight:d.weight,notes:d.notes}); render(); return;
+  if(formId==='jobReturnForm'){
+    const job=getJob(f.dataset.jobId); if(!job) return; if(!(num(d.weight)>0)) return notify(t('Weight required'),'error');
+    clearFormDraft('jobReturnForm');
+    addJobReturn(job,{date:d.date,voucher:d.voucher,type:d.type,metal:d.metal,purity:d.purity,weight:d.weight,notes:d.notes}); render(); notify(t('Material return recorded'),'success'); return;
   }
-  if(f.id==='jobQCForm'){
-    const job=getJob(f.dataset.jobId); if(!job) return; addJobQC(job,{date:d.date,result:d.result,stage:d.stage,checker:d.checker,notes:d.notes}); render(); return;
+  if(formId==='jobQCForm'){
+    const job=getJob(f.dataset.jobId); if(!job) return;
+    clearFormDraft('jobQCForm');
+    addJobQC(job,{date:d.date,result:d.result,stage:d.stage,checker:d.checker,notes:d.notes}); render(); notify(t('Quality check saved'),'success'); return;
   }
 
   // Report filter forms
-  if(f.id==='salesFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterCustomer=d.reportFilterCustomer||'all'; state.reportFilterCategory=d.reportFilterCategory||'all'; render(); return;}
-  if(f.id==='purchaseFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterSupplier=d.reportFilterSupplier||'all'; render(); return;}
-  if(f.id==='stockFilter'){state.reportFilterCategory=d.reportFilterCategory||'all'; state.reportFilterMetal=d.reportFilterMetal||'all'; render(); return;}
-  if(f.id==='metalBalanceFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterCategory=d.reportFilterCategory||'all'; render(); return;}
-  if(f.id==='karigarFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterKarigar=d.reportFilterKarigar||'all'; render(); return;}
-  if(f.id==='customerFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterCustomer=d.reportFilterCustomer||'all'; render(); return;}
-  if(f.id==='supplierFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterSupplier=d.reportFilterSupplier||'all'; render(); return;}
-  if(f.id==='expenseFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterCategory=d.reportFilterCategory||'all'; render(); return;}
-  if(f.id==='pnlFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; render(); return;}
-  if(f.id==='cashFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; render(); return;}
+  if(formId==='salesFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterCustomer=d.reportFilterCustomer||'all'; state.reportFilterCategory=d.reportFilterCategory||'all'; render(); return;}
+  if(formId==='purchaseFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterSupplier=d.reportFilterSupplier||'all'; render(); return;}
+  if(formId==='stockFilter'){state.reportFilterCategory=d.reportFilterCategory||'all'; state.reportFilterMetal=d.reportFilterMetal||'all'; render(); return;}
+  if(formId==='metalBalanceFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterCategory=d.reportFilterCategory||'all'; render(); return;}
+  if(formId==='karigarFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterKarigar=d.reportFilterKarigar||'all'; render(); return;}
+  if(formId==='customerFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterCustomer=d.reportFilterCustomer||'all'; render(); return;}
+  if(formId==='supplierFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterSupplier=d.reportFilterSupplier||'all'; render(); return;}
+  if(formId==='expenseFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; state.reportFilterCategory=d.reportFilterCategory||'all'; render(); return;}
+  if(formId==='pnlFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; render(); return;}
+  if(formId==='cashFilter'){state.reportStartDate=d.reportStartDate||''; state.reportEndDate=d.reportEndDate||''; render(); return;}
 });
 
 // Optional boot overrides: ?lang=ne&country=NP (handy for testing and shared links)
@@ -3706,17 +4349,31 @@ try{
   const qp=new URLSearchParams(location.search);
   if(qp.get('country')){ const c=qp.get('country').toUpperCase(); state.settings=applyCountryPreset({...state.settings,country:c},c); }
   if(qp.get('lang')) state.settings.language=qp.get('lang');
-}catch(e){}
+}catch(err){console.error('Boot URL param error:',err);}
 setLanguage(state.settings.language||'en');
 setNumeralStyle(state.settings.numeralStyle||'devanagari');
 setCountry(state.settings.country||'NP');
 
 let booted=false;
-function bootApp(){
+async function bootApp(){
   if(booted) return; booted=true;
-  render();
+  // Wait for page modules to finish loading so the first paint never shows the
+  // "Page not available" fallback during a refresh.
+  try { await preloadPageModules; } catch(_) {}
+  render();;
   maybeAutoSyncRates();
-  if('serviceWorker' in navigator) window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}));
+  // Only register the service worker in production. In dev it caches the dev
+  // shell and fights Vite HMR, causing unsolicited page refreshes.
+  if('serviceWorker' in navigator && import.meta.env && import.meta.env.PROD){
+    window.addEventListener('load',()=>navigator.serviceWorker.register('/sw.js').catch(()=>{}));
+  } else if('serviceWorker' in navigator){
+    // Dev: remove any stale service worker + caches left from production runs
+    // so the browser always loads fresh source instead of a cached old bundle.
+    try{
+      navigator.serviceWorker.getRegistrations().then(rs=>rs.forEach(r=>r.unregister())).catch(()=>{});
+      if(window.caches) caches.keys().then(ks=>ks.forEach(k=>caches.delete(k))).catch(()=>{});
+    }catch(_){}
+  }
 }
 // reliability.js initializes auth on DOMContentLoaded; wait for it so a valid
 // session is not lost to a race with the first render.

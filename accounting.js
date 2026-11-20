@@ -9,6 +9,14 @@
  * JavaScript floating-point arithmetic is never used for ledger balances.
  */
 
+import {
+  calcItemCost, calcCartTotals as trustedCalcCartTotals, calcInvoiceTotal, calcExchangeValue,
+  calcJobFinancials, validateSaleFinancials, toMinorUnits, fromMinorUnits,
+  formatMinorUnits, roundWeight3, roundCurrency2, roundPercent4,
+  validatePurity, validateTaxRate, validateMetalRate, validateWeight,
+  validateMakingCharge, validateWastagePercent, WEIGHT_MILLI
+} from './financial.js';
+
 export const ACCOUNTING_VERSION = 1;
 export const CURRENCY_MINOR = 100;
 
@@ -143,6 +151,8 @@ export function ensureAccounting(state) {
   if (!Array.isArray(acc.lines)) acc.lines = [];
   if (typeof acc.sequence !== 'number') acc.sequence = 0;
   if (!Array.isArray(acc.fiscalYears)) acc.fiscalYears = [];
+  if (!Array.isArray(acc.income)) acc.income = [];
+  if (!Array.isArray(acc.expenses)) acc.expenses = [];
 
   const existing = new Set(acc.accounts.map(a => a.code));
   for (const account of ACCOUNTS) {
@@ -320,19 +330,31 @@ export function accountLedger(state, accountCode, range = null) {
   return rows;
 }
 
-/** Sale mapping: cash/bank/AR vs revenue, output VAT and COGS. */
-export function saleLines(sale, items = []) {
-  const total = toMinor(sale.total);
-  const tax = toMinor(sale.tax || 0);
-  const paid = Math.min(total, (sale.payments || []).reduce((s, p) => s + toMinor(p.amount), 0));
+/** Sale mapping: cash/bank/AR vs revenue, output VAT and COGS.
+ * Totals are recalculated from item line items — never trusts client-submitted sale.total.
+ * taxRate and taxInclusive are passed from the caller (postSale) which has access to state.settings.
+ */
+export function saleLines(sale, items = [], taxRate = 0, taxInclusive = true) {
+  if (!sale || !sale.id) return { ok: false, error: 'Sale required' };
+  if (!Array.isArray(items) || items.length === 0) return { ok: false, error: 'At least one item required' };
+
+  // Authoritative recalculation from raw item inputs
+  const recalculated = calcInvoiceTotal(sale, items, taxRate, taxInclusive);
+  if (!recalculated.ok) return { ok: false, error: `Invoice recalculation failed: ${recalculated.error}` };
+
+  const total = recalculated.result.totalMinor;
+  const tax = recalculated.result.taxMinor;
+  const paid = Math.min(total, (sale.payments || []).reduce((s, p) => s + toMinorUnits(p.amount || 0), 0));
   const unpaid = total - paid;
   const revenue = total - tax;
   const lines = [];
 
   const byAccount = new Map();
+  let remaining = total;
   for (const payment of sale.payments || []) {
-    const amount = toMinor(payment.amount);
+    const amount = Math.min(toMinorUnits(payment.amount || 0), remaining);
     if (amount <= 0) continue;
+    remaining -= amount;
     const account = paymentAccount(payment.method);
     byAccount.set(account, (byAccount.get(account) || 0) + amount);
   }
@@ -341,7 +363,7 @@ export function saleLines(sale, items = []) {
   if (revenue > 0) lines.push(makeLine('4000', 0, revenue, 'Sales revenue'));
   if (tax > 0) lines.push(makeLine('2100', 0, tax, 'Output VAT'));
 
-  const costByItem = new Map((items || []).map(i => [i.id, toMinor(i.costPrice || 0)]));
+  const costByItem = new Map((items || []).map(i => [(i.id || i.itemId), toMinorUnits(i.costPrice || 0)]));
   let cogs = 0;
   for (const line of sale.items || []) {
     const unit = costByItem.get(line.itemId) || 0;
@@ -354,12 +376,12 @@ export function saleLines(sale, items = []) {
 
   const balanced = validateLines(lines);
   if (!balanced.ok) return { ok: false, error: balanced.error };
-  return { ok: true, lines };
+  return { ok: true, lines, recalculated: recalculated.result };
 }
 
 export function postSale(state, sale, items) {
   if (!sale || !sale.id) return { ok: false, error: 'Sale required' };
-  const mapped = saleLines(sale, items);
+  const mapped = saleLines(sale, items, Number(state.settings?.taxRate || 0), state.settings?.taxInclusive !== false);
   if (!mapped.ok) return mapped;
   return postJournal(state, {
     date: sale.date,
@@ -457,7 +479,7 @@ export function backfill(state) {
   const result = { posted: 0, skipped: 0, errors: [] };
 
   for (const sale of state.sales || []) {
-    const r = postSale(state, sale, state.items || []);
+    const r = postSale(state, sale, sale.items || []);
     if (r.ok) result.posted += 1;
     else if (r.duplicate) result.skipped += 1;
     else result.errors.push(`Sale ${sale.invoice || sale.id}: ${r.error}`);

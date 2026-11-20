@@ -7,10 +7,42 @@
  * To translate: edit locales/ne.json — map the English text to Nepali.
  * Missing entries fall back to English automatically.
  */
-import enCatalog from './locales/en.json';
-import neCatalog from './locales/ne.json';
-import hiCatalog from './locales/hi.json';
 import NepaliDate from 'nepali-date-converter';
+
+const localeCache = {};
+async function loadLocale(code) {
+  if (localeCache[code]) return localeCache[code];
+  try {
+    const module = await import(`./locales/${code}.json`);
+    localeCache[code] = module.default || module;
+    return localeCache[code];
+  } catch {
+    localeCache[code] = {};
+    return {};
+  }
+}
+
+const CATALOGS = { en: {}, ne: {}, hi: {} };
+let lang = 'en';
+let countryCode = 'NP';
+let localeLoadPromise = null;
+
+// English uses source keys directly (no translation file needed)
+CATALOGS.en = {};
+
+async function ensureLocaleLoaded(code) {
+  if (CATALOGS[code] && Object.keys(CATALOGS[code]).length > 0) return;
+  if (!localeLoadPromise) {
+    localeLoadPromise = Promise.all([
+      loadLocale('ne'),
+      loadLocale('hi')
+    ]).then(([ne, hi]) => {
+      CATALOGS.ne = ne;
+      CATALOGS.hi = hi;
+    });
+  }
+  await localeLoadPromise;
+}
 
 export const LOCALES = {
   en: { label: 'English', native: 'English', tag: 'en-US', dir: 'ltr' },
@@ -99,11 +131,12 @@ export const COUNTRIES = {
 
 export const COUNTRY_OPTIONS = Object.entries(COUNTRIES).map(([code, c]) => ({ value: code, label: `${c.name} — ${c.currency}` }));
 
-const CATALOGS = { en: enCatalog, ne: neCatalog, hi: hiCatalog };
-let lang = 'en';
-let countryCode = 'NP';
-
 export function setLanguage(code) {
+  if (CATALOGS[code] && Object.keys(CATALOGS[code]).length === 0 && code !== 'en') {
+    loadLocale(code).then(locale => {
+      CATALOGS[code] = locale;
+    });
+  }
   lang = CATALOGS[code] ? code : 'en';
   if (typeof document !== 'undefined') {
     document.documentElement.lang = lang;
@@ -274,8 +307,8 @@ function formatDateLongAd(value, settings = {}) {
   }
 }
 
-const GRAMS = { gram: 1, tola: 11.6638, aana: 0.7289875, lal: 0.116638, ratti: 0.1215 };
-const NE_UNIT_LABELS = { gram: 'ग्राम', tola: 'तोला', aana: 'आना', lal: 'लाल', ratti: 'रत्ती' };
+const GRAMS = { gram: 1, tola: 11.6638, suki: 2.91595, aana: 0.7289875, lal: 0.116638, ratti: 0.1215 };
+const NE_UNIT_LABELS = { gram: 'ग्राम', tola: 'तोला', suki: 'सुकी', aana: 'आना', lal: 'लाल', ratti: 'रत्ती' };
 /** Weight display in the country's customary unit (tola for NP/IN, grams elsewhere). */
 export function formatWeight(grams, settings = {}, decimals = 3) {
   const unit = settings.weightUnit || countryProfile(settings.country).weightUnit || 'gram';
@@ -317,8 +350,9 @@ const LOCALIZABLE = [
   '.btn span', 'button span', 'h4', 'h5', 'h6', 'label', 'option'
 ].join(',');
 
-export function localizeDom(root = (typeof document !== 'undefined' ? document : null)) {
+export async function localizeDom(root = (typeof document !== 'undefined' ? document : null)) {
   if (!root || lang === 'en') return;
+  await ensureLocaleLoaded(lang);
   const table = CATALOGS[lang] || {};
   let nodes;
   try { nodes = root.querySelectorAll(LOCALIZABLE); } catch { return; }
